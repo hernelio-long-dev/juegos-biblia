@@ -1,11 +1,17 @@
 import { createClient } from '@supabase/supabase-js'
 
-const url = import.meta.env.VITE_SUPABASE_URL as string
-const key = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string
+const envUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined
+const envKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string | undefined
 
-if (!url || !key) {
-  throw new Error('Faltan VITE_SUPABASE_URL o VITE_SUPABASE_PUBLISHABLE_KEY en el archivo .env')
+/** true si la app se compiló sin las variables de Supabase (se muestra un aviso en lugar de una pantalla vacía). */
+export const missingConfig = !envUrl || !envKey
+if (missingConfig) {
+  console.error('Faltan VITE_SUPABASE_URL o VITE_SUPABASE_PUBLISHABLE_KEY al compilar (.env / .env.production)')
 }
+
+// Valores de relleno solo para que createClient no falle; la app no se renderiza sin configuración.
+const url = envUrl || 'https://config-faltante.supabase.co'
+const key = envKey || 'config-faltante'
 
 export const supabase = createClient(url, key)
 
