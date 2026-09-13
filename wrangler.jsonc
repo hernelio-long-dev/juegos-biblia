@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "competencia-biblica",
+  "compatibility_date": "2026-09-01",
+  // Solo archivos estáticos (la lógica vive en Supabase), sin código de Worker.
+  "assets": {
+    "directory": "./dist",
+    // SPA: cualquier ruta desconocida (/jugar, /admin/sala/...) devuelve index.html
+    "not_found_handling": "single-page-application"
+  }
+}
