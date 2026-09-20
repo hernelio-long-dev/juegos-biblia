@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router'
 import QRCode from 'qrcode'
-import { Leaderboard, Podium } from '../../components/Leaderboard'
+import { Leaderboard, Podium, TeamLeaderboard } from '../../components/Leaderboard'
 import { CountdownRing, DifficultyChip, ErrorBox, Spinner } from '../../components/ui'
 import { secondsLeft, useClockSync, useServerNow } from '../../lib/clock'
 import { celebrate } from '../../lib/fx'
@@ -9,18 +9,15 @@ import { useLiveRefresh } from '../../lib/realtime'
 import { emojiPoints } from '../../lib/scoring'
 import { errorMessage, supabase } from '../../lib/supabase'
 import {
-  DIFFICULTIES, DIFFICULTY_LABEL, EMOJI_FINAL_SECONDS, GAME_LABEL, OPTION_STYLES, QUIZ_SECONDS,
-  type AnswerRow, type Difficulty, type EmojiItem, type Game, type Room, type RoomView, type Round, type ScoreRow,
+  DIFFICULTIES, DIFFICULTY_LABEL, EMOJI_FINAL_SECONDS, GAME_ICON, GAME_LABEL, GAMES, OPTION_STYLES,
+  QUIZ_SECONDS, TABOO_SECONDS, teamStyle,
+  type AnswerRow, type Difficulty, type EmojiItem, type Game, type PlayerStatus, type Room, type RoomView,
+  type Round, type ScoreRow, type TabooItem, type Team, type TeamScoreRow,
 } from '../../lib/types'
-
-interface PlayerStatus {
-  participant_id: string
-  name: string
-  joined_at: string
-  last_seen: string | null
-}
+import TeamsDrawer, { suggestedTeams } from './TeamsDrawer'
 
 type Remaining = Record<Game, Record<Difficulty, number>>
+type BoardView = Game | 'teams' | null
 
 export default function RoomConsole() {
   const { roomId = '' } = useParams()
@@ -31,11 +28,15 @@ export default function RoomConsole() {
   const [code, setCode] = useState<string | null>(null)
   const [round, setRound] = useState<Round | null>(null)
   const [emojiItem, setEmojiItem] = useState<EmojiItem | null>(null)
+  const [tabooItem, setTabooItem] = useState<TabooItem | null>(null)
   const [answers, setAnswers] = useState<AnswerRow[]>([])
   const [players, setPlayers] = useState<PlayerStatus[]>([])
   const [registered, setRegistered] = useState(0)
   const [scores, setScores] = useState<ScoreRow[]>([])
-  const [boardGame, setBoardGame] = useState<Game | null>(null)
+  const [boardGame, setBoardGame] = useState<BoardView>(null)
+  const [teams, setTeams] = useState<Team[]>([])
+  const [teamScores, setTeamScores] = useState<TeamScoreRow[]>([])
+  const [teamId, setTeamId] = useState<string | null>(null)
   const [remaining, setRemaining] = useState<Remaining | null>(null)
   const [game, setGame] = useState<Game>('emoji')
   const [difficulty, setDifficulty] = useState<Difficulty>('facil')
@@ -43,6 +44,8 @@ export default function RoomConsole() {
   const [error, setError] = useState('')
   const [showControls, setShowControls] = useState(true)
   const [showPlayers, setShowPlayers] = useState(false)
+  const [showTeams, setShowTeams] = useState(false)
+  const [peek, setPeek] = useState(false)
   const [notFound, setNotFound] = useState(false)
 
   // ------------------------------------------------------------ carga de datos
@@ -73,20 +76,34 @@ export default function RoomConsole() {
   }, [roomId])
 
   const loadScores = useCallback(async () => {
-    const { data } = await supabase.rpc('room_scoreboard', { p_room: roomId, p_game: boardGame })
+    const game = boardGame === 'teams' ? null : boardGame
+    const [{ data }, { data: t }] = await Promise.all([
+      supabase.rpc('room_scoreboard', { p_room: roomId, p_game: game }),
+      supabase.rpc('room_team_scoreboard', { p_room: roomId }),
+    ])
     if (data) setScores(data as ScoreRow[])
+    if (t) setTeamScores(t as TeamScoreRow[])
   }, [roomId, boardGame])
 
+  const loadTeams = useCallback(async () => {
+    const { data } = await supabase.rpc('room_teams', { p_room: roomId })
+    if (!data) return
+    const list = data as Team[]
+    setTeams(list)
+    setTeamId((cur) => (cur && list.some((t) => t.id === cur) ? cur : list[0]?.id ?? null))
+  }, [roomId])
+
   const loadRemaining = useCallback(async () => {
-    const [{ data: e }, { data: q }, { data: used }] = await Promise.all([
+    const [{ data: e }, { data: q }, { data: tb }, { data: used }] = await Promise.all([
       supabase.from('emoji_items').select('id, difficulty'),
       supabase.from('quiz_questions').select('id, difficulty'),
+      supabase.from('taboo_items').select('id, difficulty'),
       supabase.from('rounds').select('item_id').eq('room_id', roomId),
     ])
     const usedSet = new Set((used ?? []).map((u) => u.item_id))
     const count = (rows: { id: string; difficulty: Difficulty }[] | null) =>
       Object.fromEntries(DIFFICULTIES.map((d) => [d, (rows ?? []).filter((x) => x.difficulty === d && !usedSet.has(x.id)).length])) as Record<Difficulty, number>
-    setRemaining({ emoji: count(e), quiz: count(q) })
+    setRemaining({ emoji: count(e), quiz: count(q), taboo: count(tb) })
   }, [roomId])
 
   const roundId = round?.id ?? null
@@ -96,7 +113,7 @@ export default function RoomConsole() {
     if (data) setAnswers(data as AnswerRow[])
   }, [roundId])
 
-  useEffect(() => { loadRoom(); loadPlayers(); loadRemaining() }, [loadRoom, loadPlayers, loadRemaining])
+  useEffect(() => { loadRoom(); loadPlayers(); loadRemaining(); loadTeams() }, [loadRoom, loadPlayers, loadRemaining, loadTeams])
   useEffect(() => { loadAnswers() }, [loadAnswers])
   useEffect(() => { loadScores() }, [loadScores, room?.view, round?.status])
 
@@ -107,11 +124,23 @@ export default function RoomConsole() {
     supabase.from('emoji_items').select('*').eq('id', round.item_id).single().then(({ data }) => setEmojiItem(data as EmojiItem))
   }, [round, emojiItem?.id])
 
+  // palabra de Tabú: no se pinta en la pantalla grande salvo que el admin la pida.
+  useEffect(() => {
+    if (!round || round.game !== 'taboo') return setTabooItem(null)
+    if (tabooItem?.id === round.item_id) return
+    supabase.from('taboo_items').select('*').eq('id', round.item_id).single().then(({ data }) => setTabooItem(data as TabooItem))
+  }, [round, tabooItem?.id])
+  useEffect(() => { setPeek(false) }, [round?.id])
+
   useLiveRefresh(roomId, [
     { table: 'rooms', filter: `id=eq.${roomId}` },
     { table: 'rounds', filter: `room_id=eq.${roomId}` },
   ], loadRoom, 5000)
   useLiveRefresh(`players-${roomId}`, [{ table: 'room_players' }], loadPlayers, 5000)
+  useLiveRefresh(`teams-${roomId}`, [
+    { table: 'teams', filter: `room_id=eq.${roomId}` },
+    { table: 'team_members', filter: `room_id=eq.${roomId}` },
+  ], loadTeams, 8000)
   useLiveRefresh(roundId ? `answers-${roundId}` : null, [{ table: 'answers', filter: `round_id=eq.${roundId}` }], loadAnswers, 3000)
   useLiveRefresh(room?.view === 'leaderboard' || room?.view === 'podium' ? `scores-${roomId}` : null, [{ table: 'rounds', filter: `room_id=eq.${roomId}` }], loadScores, 4000)
 
@@ -128,9 +157,29 @@ export default function RoomConsole() {
   const startRound = useCallback(async (g: Game = game, d: Difficulty = difficulty) => {
     setGame(g)
     setDifficulty(d)
-    await run(() => supabase.rpc('start_round', { p_room: roomId, p_game: g, p_difficulty: d }))
+    if (g === 'taboo') {
+      if (!teamId) return setError('Primero arma los equipos desde «🤝 Equipos».')
+      await run(() => supabase.rpc('start_taboo_round', { p_room: roomId, p_difficulty: d, p_team: teamId }))
+      // el turno pasa solo al siguiente equipo
+      const i = teams.findIndex((t) => t.id === teamId)
+      if (i >= 0 && teams.length > 0) setTeamId(teams[(i + 1) % teams.length].id)
+    } else {
+      await run(() => supabase.rpc('start_round', { p_room: roomId, p_game: g, p_difficulty: d }))
+    }
     loadRemaining()
-  }, [game, difficulty, run, roomId, loadRemaining])
+  }, [game, difficulty, run, roomId, loadRemaining, teamId, teams])
+
+  const startTaboo = useCallback(() => {
+    if (round?.game === 'taboo' && round.status === 'pending') {
+      run(() => supabase.rpc('start_taboo_timer', { p_round: round.id }))
+    }
+  }, [round, run])
+
+  const stopTaboo = useCallback((guessed: boolean) => {
+    if (round?.game === 'taboo' && round.status !== 'revealed') {
+      run(() => supabase.rpc('stop_taboo', { p_round: round.id, p_guessed: guessed }))
+    }
+  }, [round, run])
 
   const reveal = useCallback(() => {
     if (round?.status === 'active') run(() => supabase.rpc('reveal_round', { p_round: round.id, p_force: true }))
@@ -169,7 +218,8 @@ export default function RoomConsole() {
     if (now < new Date(round.started_at).getTime()) return
     const timeOver = round.deadline !== null && now > new Date(round.deadline).getTime() + 1500
     const correctCount = roundAnswers.filter((a) => a.is_correct).length
-    const everyone = players.length > 0 && (
+    // En Tabú solo manda el cronómetro: el admin decide si acertaron.
+    const everyone = players.length > 0 && round.game !== 'taboo' && (
       round.game === 'quiz' ? roundAnswers.length >= players.length : correctCount >= players.length
     )
     if (timeOver || everyone) {
@@ -202,15 +252,20 @@ export default function RoomConsole() {
       else if (e.key === 'f' || e.key === 'F') toggleFullscreen()
       else if (e.key === 't' || e.key === 'T') setView(room?.view === 'leaderboard' ? 'round' : 'leaderboard')
       else if (e.key === 'r' || e.key === 'R') reveal()
+      else if (e.key === 'Enter' && round?.game === 'taboo' && round.status === 'active') {
+        e.preventDefault()
+        stopTaboo(true)
+      }
       else if (e.key === ' ' || e.key === 'ArrowRight') {
         e.preventDefault()
         if (round?.status === 'active' && round.game === 'emoji') nextClue()
+        else if (round?.game === 'taboo' && round.status === 'pending') startTaboo()
         else if (room?.view !== 'podium') startRound()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [room?.view, round, nextClue, reveal, setView, startRound])
+  }, [room?.view, round, nextClue, reveal, setView, startRound, startTaboo, stopTaboo])
 
   if (notFound) {
     return <div className="p-10 text-center">Sala no encontrada. <Link className="text-amber-300 underline" to="/admin">Volver</Link></div>
@@ -239,6 +294,9 @@ export default function RoomConsole() {
         <button className="btn-secondary px-3 py-2" onClick={() => setShowPlayers(true)}>
           👥 {players.length}
         </button>
+        <button className="btn-secondary px-3 py-2" onClick={() => setShowTeams(true)} title="Equipos de Tabú">
+          🤝 {teams.length || '—'}
+        </button>
         <button className="btn-secondary hidden px-3 py-2 sm:inline-flex" onClick={toggleFullscreen} title="Pantalla completa (F)">⛶</button>
       </header>
 
@@ -251,20 +309,23 @@ export default function RoomConsole() {
         {view === 'round' && round && round.game === 'quiz' && (
           <QuizStage round={round} answers={roundAnswers} players={players} now={now} />
         )}
+        {view === 'round' && round && round.game === 'taboo' && (
+          <TabooStage round={round} item={peek ? tabooItem : null} teams={teams} scores={teamScores} answers={roundAnswers} now={now} />
+        )}
         {view === 'leaderboard' && (
           <div className="mx-auto w-full max-w-5xl">
             <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
               <h1 className="font-display text-4xl font-bold sm:text-5xl">📊 Tabla de posiciones</h1>
-              <div className="flex gap-2">
-                {([null, 'emoji', 'quiz'] as const).map((g) => (
+              <div className="flex flex-wrap gap-2">
+                {([null, 'emoji', 'quiz', 'taboo', 'teams'] as const).map((g) => (
                   <button key={g ?? 'all'} onClick={() => setBoardGame(g)}
                     className={`btn px-4 py-2 ${boardGame === g ? 'bg-white text-indigo-950' : 'bg-white/10'}`}>
-                    {g ? GAME_LABEL[g] : 'General'}
+                    {g === null ? 'General' : g === 'teams' ? '🤝 Equipos' : GAME_LABEL[g]}
                   </button>
                 ))}
               </div>
             </div>
-            <Leaderboard rows={scores} big />
+            {boardGame === 'teams' ? <TeamLeaderboard rows={teamScores} big /> : <Leaderboard rows={scores} big />}
           </div>
         )}
         {view === 'podium' && (
@@ -294,16 +355,34 @@ export default function RoomConsole() {
                     👉 Siguiente pista ({round.clues_revealed}/{round.clues_total})
                   </button>
                 )}
-                {view === 'round' && round?.status === 'active' && (
+                {view === 'round' && round?.game === 'taboo' && round.status === 'pending' && (
+                  <button className="btn-primary px-6 text-lg" onClick={startTaboo} disabled={busy} title="Espacio">
+                    ▶ Iniciar {TABOO_SECONDS} s
+                  </button>
+                )}
+                {view === 'round' && round?.game === 'taboo' && round.status === 'active' && (
+                  <>
+                    <button className="btn bg-emerald-500 px-6 text-lg text-white hover:bg-emerald-400" onClick={() => stopTaboo(true)} disabled={busy} title="Enter">
+                      ✅ ¡Adivinaron!
+                    </button>
+                    <button className="btn-secondary" onClick={() => stopTaboo(false)} disabled={busy}>⏹️ No adivinaron</button>
+                  </>
+                )}
+                {view === 'round' && round?.game === 'taboo' && round.status !== 'revealed' && (
+                  <button className="btn-ghost px-3 py-2 text-sm" onClick={() => setPeek((p) => !p)}>
+                    {peek ? '🙈 Ocultar palabra' : '👁️ Ver palabra'}
+                  </button>
+                )}
+                {view === 'round' && round?.status === 'active' && round.game !== 'taboo' && (
                   <button className="btn-secondary" onClick={reveal} disabled={busy}>👁️ Revelar respuesta</button>
                 )}
 
                 {/* lanzador */}
                 <div className="flex flex-wrap items-center gap-2 rounded-2xl bg-white/5 p-1.5">
-                  {(['emoji', 'quiz'] as Game[]).map((g) => (
+                  {GAMES.map((g) => (
                     <button key={g} onClick={() => setGame(g)}
                       className={`btn px-3 py-2 text-sm ${game === g ? 'bg-indigo-500 text-white' : 'bg-transparent text-indigo-200 hover:bg-white/10'}`}>
-                      {g === 'emoji' ? '😀 Emojis' : '❓ Selección'}
+                      {GAME_ICON[g]} {g === 'emoji' ? 'Emojis' : g === 'quiz' ? 'Selección' : 'Tabú'}
                     </button>
                   ))}
                   <span className="mx-1 h-6 w-px bg-white/15" />
@@ -313,10 +392,24 @@ export default function RoomConsole() {
                       {DIFFICULTY_LABEL[d]} <span className="opacity-60">{remaining?.[game][d] ?? '–'}</span>
                     </button>
                   ))}
+                  {game === 'taboo' && (
+                    <>
+                      <span className="mx-1 h-6 w-px bg-white/15" />
+                      <select
+                        className="input w-auto py-2 text-sm"
+                        value={teamId ?? ''}
+                        onChange={(e) => setTeamId(e.target.value || null)}
+                        aria-label="Equipo que juega"
+                      >
+                        {teams.length === 0 && <option value="">Sin equipos</option>}
+                        {teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+                      </select>
+                    </>
+                  )}
                   <button
                     className={`${round?.status === 'active' ? 'btn-secondary' : 'btn-primary'} px-5 py-2`}
                     onClick={() => startRound()}
-                    disabled={busy || !remaining || remaining[game][difficulty] === 0}
+                    disabled={busy || !remaining || remaining[game][difficulty] === 0 || (game === 'taboo' && !teamId)}
                     title="Espacio"
                   >
                     ▶ {view === 'round' && round ? 'Siguiente ronda' : 'Iniciar juego'}
@@ -339,12 +432,18 @@ export default function RoomConsole() {
                 </div>
               </div>
             )}
+            {game === 'taboo' && teams.length === 0 && (
+              <p className="text-sm text-amber-200">
+                Tabú necesita equipos. Pulsa <b>🤝</b> arriba y reparte a los {players.length} de la sala
+                {players.length >= 2 && <> (sugerencia: {suggestedTeams(players.length)} equipos)</>}.
+              </p>
+            )}
             {view === 'lobby' && !closed && players.length > 0 && (
               <p className="text-sm text-indigo-300">
                 {registered > 0 && players.length / registered >= 0.5
                   ? '✅ La mayoría ya está conectada: puedes iniciar el juego.'
                   : `Esperando participantes… (${onlinePlayers} en línea)`}
-                <span className="ml-2 hidden opacity-70 md:inline">Atajos: Espacio = siguiente · R = revelar · T = tabla · H = ocultar · F = pantalla completa</span>
+                <span className="ml-2 hidden opacity-70 md:inline">Atajos: Espacio = siguiente · Enter = ¡adivinaron! · R = revelar · T = tabla · H = ocultar · F = pantalla completa</span>
               </p>
             )}
           </div>
@@ -357,6 +456,9 @@ export default function RoomConsole() {
 
       {showPlayers && (
         <PlayersDrawer players={players} registered={registered} now={now} onClose={() => setShowPlayers(false)} onRelease={release} />
+      )}
+      {showTeams && (
+        <TeamsDrawer roomId={roomId} teams={teams} players={players} onClose={() => setShowTeams(false)} onChanged={loadTeams} />
       )}
     </div>
   )
@@ -569,6 +671,88 @@ function QuizStage({ round, answers, players, now }: { round: Round; answers: An
         )}
         {revealed && fastest.length === 0 && (
           <p className="text-center font-display text-3xl text-indigo-200">Nadie acertó esta vez 😮</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function TabooStage({ round, item, teams, scores, answers, now }: {
+  round: Round; item: TabooItem | null; teams: Team[]; scores: TeamScoreRow[]; answers: AnswerRow[]; now: number
+}) {
+  const team = teams.find((t) => t.id === round.team_id)
+  const style = teamStyle(team?.seq ?? 1)
+  const describer = team?.members.find((m) => m.id === round.describer_id)
+  const pending = round.status === 'pending'
+  const revealed = round.status === 'revealed'
+  const left = secondsLeft(round.deadline, now) ?? TABOO_SECONDS
+  const won = answers.find((a) => a.is_correct)
+  const usedSeconds = won?.elapsed_ms != null ? won.elapsed_ms / 1000 : null
+
+  return (
+    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col">
+      <StageHeader round={round} right={
+        <span className={`chip px-4 py-2 text-lg ${style.soft}`}>🤝 {team?.name ?? 'Equipo'}</span>
+      } />
+
+      <div className="flex flex-1 flex-col items-center justify-center gap-8 text-center">
+        {revealed ? (
+          <div className="animate-rise">
+            <p className="text-2xl text-indigo-200">La palabra era</p>
+            <p className="font-display text-6xl font-bold text-amber-300 sm:text-7xl">{round.answer_text}</p>
+            {won ? (
+              <p className="mt-6 font-display text-3xl font-bold text-emerald-200 sm:text-4xl">
+                🎉 {team?.name} la adivinó en {usedSeconds?.toFixed(1)} s · +{won.points} pts para cada integrante
+              </p>
+            ) : (
+              <p className="mt-6 font-display text-3xl text-indigo-200 sm:text-4xl">⏰ Se acabaron los {TABOO_SECONDS} s · 0 puntos</p>
+            )}
+          </div>
+        ) : (
+          <>
+            <div>
+              <p className="text-2xl text-indigo-200">Describe</p>
+              <p className={`font-display text-6xl font-bold sm:text-7xl ${style.text}`}>{describer?.name ?? '—'}</p>
+              <p className="mt-2 text-2xl text-indigo-200">
+                {pending ? 'Está leyendo su palabra en el celular…' : `Adivina ${team?.name ?? 'su equipo'}`}
+              </p>
+            </div>
+
+            {pending ? (
+              <div className="animate-pop rounded-3xl bg-white/5 px-10 py-8">
+                <p className="font-display text-4xl font-bold text-amber-300">🤫 ¡Prepárense!</p>
+                <p className="mt-3 max-w-2xl text-xl text-indigo-200">
+                  No puede decir la palabra ni las prohibidas, ni deletrear, ni hacer señas.
+                  Solo responde su equipo; los demás escuchan en silencio.
+                </p>
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center justify-center gap-8">
+                <CountdownRing seconds={left} total={TABOO_SECONDS} size={220} />
+                <p className="font-display text-4xl font-bold text-indigo-100">
+                  {left > 0 ? '¡Griten la respuesta!' : '¡Tiempo!'}
+                </p>
+              </div>
+            )}
+
+            {item && (
+              <div className="rounded-2xl border border-amber-400/40 bg-amber-400/10 px-5 py-3 text-left">
+                <p className="text-xs font-bold uppercase tracking-wider text-amber-200">Solo para el administrador</p>
+                <p className="font-display text-2xl font-bold text-amber-100">{item.word}</p>
+                <p className="text-sm text-amber-100/70">🚫 {item.forbidden.join(' · ')}</p>
+              </div>
+            )}
+          </>
+        )}
+
+        {scores.length > 0 && (
+          <ul className="flex flex-wrap justify-center gap-3">
+            {scores.map((t) => (
+              <li key={t.team_id} className={`chip px-4 py-2 text-lg ${teamStyle(t.seq).soft} ${t.team_id === round.team_id ? 'ring-2 ring-white/60' : ''}`}>
+                {t.name} <b className="text-amber-200">{t.points}</b>
+              </li>
+            ))}
+          </ul>
         )}
       </div>
     </div>

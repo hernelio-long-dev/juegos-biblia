@@ -44,12 +44,23 @@ create table if not exists public.quiz_questions (
   created_at    timestamptz not null default now()
 );
 
+create table if not exists public.taboo_items (
+  id         uuid primary key default gen_random_uuid(),
+  difficulty text not null check (difficulty in ('facil','intermedio','dificil')),
+  word       text not null,
+  forbidden  text[] not null check (array_length(forbidden, 1) between 3 and 6),
+  reference  text,
+  created_at timestamptz not null default now()
+);
+
 create table if not exists public.rooms (
   id               uuid primary key default gen_random_uuid(),
   name             text not null,
   status           text not null default 'open' check (status in ('open','closed')),
   view             text not null default 'lobby' check (view in ('lobby','round','leaderboard','podium')),
   current_round_id uuid,
+  -- Apágalo en salas de prueba para que no ensucien el ranking histórico.
+  counts_for_history boolean not null default true,
   created_at       timestamptz not null default now()
 );
 
@@ -77,18 +88,40 @@ create table if not exists public.player_tokens (
     references public.room_players(room_id, participant_id) on delete cascade
 );
 
+-- Tabú bíblico: los equipos se arman por sala, no son permanentes.
+create table if not exists public.teams (
+  id         uuid primary key default gen_random_uuid(),
+  room_id    uuid not null references public.rooms(id) on delete cascade,
+  name       text not null,
+  seq        int  not null,
+  created_at timestamptz not null default now(),
+  unique (room_id, seq)
+);
+
+create table if not exists public.team_members (
+  team_id        uuid not null references public.teams(id) on delete cascade,
+  room_id        uuid not null references public.rooms(id) on delete cascade,
+  participant_id uuid not null references public.participants(id) on delete cascade,
+  primary key (team_id, participant_id)
+);
+create unique index if not exists team_members_one_per_room on public.team_members(room_id, participant_id);
+alter table public.teams        replica identity full;
+alter table public.team_members replica identity full;
+
 create table if not exists public.rounds (
   id             uuid primary key default gen_random_uuid(),
   room_id        uuid not null references public.rooms(id) on delete cascade,
-  game           text not null check (game in ('emoji','quiz')),
+  game           text not null check (game in ('emoji','quiz','taboo')),
   difficulty     text not null check (difficulty in ('facil','intermedio','dificil')),
   item_id        uuid not null,
   seq            int  not null,
-  status         text not null default 'active' check (status in ('active','revealed')),
+  status         text not null default 'active' check (status in ('pending','active','revealed')),
   clues_total    int,
   clues_revealed int  not null default 0,
   prompt         text,
   options        text[],
+  team_id        uuid,   -- Tabú: equipo al que le toca el turno
+  describer_id   uuid,   -- Tabú: integrante que describe la palabra
   started_at     timestamptz not null default now(),
   deadline       timestamptz,
   answer_text    text,   -- se llena solo al revelar
@@ -102,6 +135,25 @@ do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'rooms_current_round_fk') then
     alter table public.rooms add constraint rooms_current_round_fk
       foreign key (current_round_id) references public.rounds(id) on delete set null;
+  end if;
+end $$;
+
+-- Actualiza bases creadas antes de «Tabú bíblico» y del ranking histórico.
+do $$ begin
+  alter table public.rooms  add column if not exists counts_for_history boolean not null default true;
+  alter table public.rounds add column if not exists team_id uuid;
+  alter table public.rounds add column if not exists describer_id uuid;
+  alter table public.rounds drop constraint if exists rounds_game_check;
+  alter table public.rounds add  constraint rounds_game_check   check (game in ('emoji','quiz','taboo'));
+  alter table public.rounds drop constraint if exists rounds_status_check;
+  alter table public.rounds add  constraint rounds_status_check check (status in ('pending','active','revealed'));
+  if not exists (select 1 from pg_constraint where conname = 'rounds_team_fk') then
+    alter table public.rounds add constraint rounds_team_fk
+      foreign key (team_id) references public.teams(id) on delete set null;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'rounds_describer_fk') then
+    alter table public.rounds add constraint rounds_describer_fk
+      foreign key (describer_id) references public.participants(id) on delete set null;
   end if;
 end $$;
 
@@ -210,6 +262,16 @@ language sql immutable as $$
        + greatest(0, least(20, floor((20000 - p_elapsed_ms) / 1000.0)))::int
 $$;
 
+-- Tabú: 30 base + 1.5 puntos por cada segundo que sobre de los 45,
+-- todo × nivel (fácil 1, intermedio 1.5, difícil 2). Lo ganan todos los del equipo.
+create or replace function public.taboo_points(p_difficulty text, p_elapsed_ms int) returns int
+language sql immutable as $$
+  select round(
+    (30 + 1.5 * greatest(0, least(45, 45 - p_elapsed_ms / 1000.0)))
+    * (case p_difficulty when 'dificil' then 2.0 when 'intermedio' then 1.5 else 1.0 end)
+  )::int
+$$;
+
 -- ---------------------------------------------------------------------
 -- FUNCIONES DEL ADMINISTRADOR
 -- ---------------------------------------------------------------------
@@ -248,6 +310,8 @@ begin
   select * into rd from rounds where id = p_round;
   if not found then return false; end if;
   if rd.status = 'revealed' then return true; end if;
+  -- Tabú en preparación (aún sin cronómetro): solo el admin puede cerrarla.
+  if rd.status = 'pending' and not p_force then return false; end if;
 
   if not p_force then
     select count(*) into v_players from room_players where room_id = rd.room_id;
@@ -267,13 +331,14 @@ begin
   update rounds r set
     status = 'revealed',
     revealed_at = clock_timestamp(),
-    answer_text = case when r.game = 'emoji'
-      then (select e.answer from emoji_items e where e.id = r.item_id)
+    answer_text = case r.game
+      when 'emoji' then (select e.answer from emoji_items e where e.id = r.item_id)
+      when 'taboo' then (select ti.word from taboo_items ti where ti.id = r.item_id)
       else (select q.options[q.correct_index + 1] from quiz_questions q where q.id = r.item_id) end,
     correct_index = case when r.game = 'quiz'
       then (select q.correct_index from quiz_questions q where q.id = r.item_id) end,
     clues_revealed = coalesce(r.clues_total, r.clues_revealed)
-  where r.id = p_round and r.status = 'active';
+  where r.id = p_round and r.status <> 'revealed';
   return true;
 end $$;
 
@@ -285,7 +350,7 @@ begin
   if not exists (select 1 from rooms where id = p_room and status = 'open') then
     raise exception 'La sala no está abierta';
   end if;
-  for v_old in select id from rounds where room_id = p_room and status = 'active' loop
+  for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
     perform reveal_round(v_old, true);
   end loop;
   select coalesce(max(seq), 0) + 1 into v_seq from rounds where room_id = p_room;
@@ -330,6 +395,148 @@ begin
   where id = p_round and game = 'emoji' and status = 'active' and clues_revealed < clues_total;
 end $$;
 
+-- EQUIPOS (Tabú) ------------------------------------------------------
+-- Reparte a todos los de la sala en p_teams equipos del mismo tamaño (±1), al azar.
+create or replace function public.assign_teams(p_room uuid, p_teams int default 2) returns json
+language plpgsql security definer set search_path = public as $$
+declare v_n int; v_count int; i int;
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  if exists (select 1 from rounds where room_id = p_room and game = 'taboo' and status <> 'revealed') then
+    raise exception 'Termina la ronda de Tabú en curso antes de rehacer los equipos';
+  end if;
+  select count(*) into v_count from room_players where room_id = p_room;
+  if v_count < 2 then raise exception 'Se necesitan al menos 2 participantes dentro de la sala'; end if;
+  v_n := greatest(2, least(coalesce(p_teams, 2), 6, v_count));
+
+  delete from teams where room_id = p_room;  -- en cascada borra team_members
+  for i in 1..v_n loop
+    insert into teams(room_id, name, seq) values (p_room, 'Equipo ' || i, i);
+  end loop;
+
+  with shuffled as (
+    select rp.participant_id, row_number() over (order by random()) - 1 as pos
+      from room_players rp where rp.room_id = p_room
+  )
+  insert into team_members(team_id, room_id, participant_id)
+  select t.id, p_room, s.participant_id
+    from shuffled s
+    join teams t on t.room_id = p_room and t.seq = (s.pos % v_n) + 1;
+
+  return json_build_object('teams', v_n, 'players', v_count);
+end $$;
+
+-- Mueve a una persona de equipo (o la deja sin equipo si p_team es null).
+create or replace function public.set_team(p_room uuid, p_participant uuid, p_team uuid) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  delete from team_members where room_id = p_room and participant_id = p_participant;
+  if p_team is not null then
+    if not exists (select 1 from teams where id = p_team and room_id = p_room) then
+      raise exception 'Equipo no válido para esta sala';
+    end if;
+    insert into team_members(team_id, room_id, participant_id) values (p_team, p_room, p_participant);
+  end if;
+end $$;
+
+create or replace function public.rename_team(p_team uuid, p_name text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  update teams set name = coalesce(nullif(trim(p_name), ''), name) where id = p_team;
+end $$;
+
+create or replace function public.room_teams(p_room uuid) returns json
+language sql stable security definer set search_path = public as $$
+  select coalesce(json_agg(x order by x.seq), '[]'::json) from (
+    select t.id, t.name, t.seq,
+           coalesce((select json_agg(json_build_object('id', p.id, 'name', p.name) order by p.name)
+                       from team_members m join participants p on p.id = m.participant_id
+                      where m.team_id = t.id), '[]'::json) as members
+      from teams t where t.room_id = p_room
+  ) x;
+$$;
+
+-- RONDA DE TABÚ --------------------------------------------------------
+-- Crea la ronda y elige quién describe: el del equipo que menos veces ha
+-- descrito en esta sala, con preferencia a quien está conectado.
+create or replace function public.start_taboo_round(p_room uuid, p_difficulty text, p_team uuid) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare v_seq int; v_id uuid; v_old uuid; it taboo_items; v_desc uuid;
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  if not exists (select 1 from rooms where id = p_room and status = 'open') then
+    raise exception 'La sala no está abierta';
+  end if;
+  if not exists (select 1 from teams where id = p_team and room_id = p_room) then
+    raise exception 'Equipo no válido para esta sala';
+  end if;
+  for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
+    perform reveal_round(v_old, true);
+  end loop;
+
+  select c.participant_id into v_desc from (
+    select m.participant_id,
+           exists (select 1 from room_players rp
+                    where rp.room_id = p_room and rp.participant_id = m.participant_id) as here,
+           (select count(*) from rounds r
+             where r.room_id = p_room and r.describer_id = m.participant_id) as turns
+      from team_members m where m.team_id = p_team
+  ) c order by c.here desc, c.turns, random() limit 1;
+  if v_desc is null then raise exception 'Ese equipo no tiene integrantes'; end if;
+
+  select * into it from taboo_items ti
+   where ti.difficulty = p_difficulty
+     and not exists (select 1 from rounds r where r.room_id = p_room and r.item_id = ti.id)
+   order by random() limit 1;
+  if not found then raise exception 'Ya no quedan palabras de nivel % en esta sala', p_difficulty; end if;
+
+  select coalesce(max(seq), 0) + 1 into v_seq from rounds where room_id = p_room;
+  insert into rounds(room_id, game, difficulty, item_id, seq, status, team_id, describer_id, started_at)
+  values (p_room, 'taboo', it.difficulty, it.id, v_seq, 'pending', p_team, v_desc, clock_timestamp())
+  returning id into v_id;
+
+  update rooms set current_round_id = v_id, view = 'round' where id = p_room;
+  return v_id;
+end $$;
+
+-- Arranca los 45 segundos (el describidor ya leyó su palabra).
+create or replace function public.start_taboo_timer(p_round uuid) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  update rounds set status = 'active', started_at = clock_timestamp(),
+                    deadline = clock_timestamp() + interval '45 seconds'
+   where id = p_round and game = 'taboo' and status = 'pending';
+end $$;
+
+-- El admin detiene el cronómetro. p_guessed = true → el equipo acertó y
+-- todos sus integrantes reciben los puntos según el tiempo que sobró.
+create or replace function public.stop_taboo(p_round uuid, p_guessed boolean) returns json
+language plpgsql security definer set search_path = public as $$
+declare rd rounds; v_elapsed int := 45000; v_pts int := 0; v_n int := 0;
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  select * into rd from rounds where id = p_round and game = 'taboo';
+  if not found then raise exception 'Ronda no válida'; end if;
+  if rd.status = 'revealed' then return json_build_object('ok', false, 'reason', 'already'); end if;
+
+  if p_guessed and rd.status = 'active'
+     and rd.deadline is not null and clock_timestamp() <= rd.deadline + interval '1 second' then
+    v_elapsed := greatest(0, least(45000, (extract(epoch from clock_timestamp() - rd.started_at) * 1000)::int));
+    v_pts := taboo_points(rd.difficulty, v_elapsed);
+    insert into answers(round_id, room_id, participant_id, is_correct, points, elapsed_ms)
+    select rd.id, rd.room_id, m.participant_id, true, v_pts, v_elapsed
+      from team_members m where m.team_id = rd.team_id
+    on conflict do nothing;
+    get diagnostics v_n = row_count;
+  end if;
+
+  perform reveal_round(p_round, true);
+  return json_build_object('ok', true, 'points', v_pts, 'members', v_n, 'elapsed_ms', v_elapsed);
+end $$;
+
 create or replace function public.set_room_view(p_room uuid, p_view text) returns void
 language plpgsql security definer set search_path = public as $$
 begin
@@ -342,7 +549,7 @@ language plpgsql security definer set search_path = public as $$
 declare v_old uuid;
 begin
   if not is_admin() then raise exception 'No autorizado'; end if;
-  for v_old in select id from rounds where room_id = p_room and status = 'active' loop
+  for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
     perform reveal_round(v_old, true);
   end loop;
   update rooms set status = 'closed', view = 'podium' where id = p_room;
@@ -394,6 +601,55 @@ language sql stable security definer set search_path = public as $$
     from s order by pts desc, name;
 $$;
 
+-- Tabla por equipos (solo Tabú). Los puntos del equipo son los de la ronda,
+-- no la suma de lo que recibió cada integrante.
+create or replace function public.room_team_scoreboard(p_room uuid)
+returns table(team_id uuid, name text, seq int, members int, points int, wins int, rank int)
+language sql stable security definer set search_path = public as $$
+  with per_round as (
+    select rd.id as round_id, rd.team_id as tid, coalesce(max(a.points), 0) as pts
+      from rounds rd
+      left join answers a on a.round_id = rd.id
+     where rd.room_id = p_room and rd.game = 'taboo' and rd.status = 'revealed'
+     group by rd.id, rd.team_id
+  ), s as (
+    select t.id, t.name, t.seq,
+           (select count(*) from team_members m where m.team_id = t.id)::int as members,
+           coalesce((select sum(pr.pts) from per_round pr where pr.tid = t.id), 0)::int as pts,
+           (select count(*) from per_round pr where pr.tid = t.id and pr.pts > 0)::int as wins
+      from teams t where t.room_id = p_room
+  )
+  select id, name, seq, members, pts, wins, (rank() over (order by pts desc))::int
+    from s order by pts desc, seq;
+$$;
+
+-- Acumulado histórico por persona: suma todo lo ganado en cualquier sala marcada
+-- como «cuenta para el histórico», sin importar si sigue abierta o si la persona
+-- ya no está dentro. p_game: null | 'emoji' | 'quiz' | 'taboo'
+create or replace function public.global_scoreboard(p_game text default null)
+returns table(participant_id uuid, name text, points int, correct int, rooms int, rank int)
+language sql stable security definer set search_path = public as $$
+  with played as (
+    select a.participant_id, a.room_id, a.points, a.is_correct
+      from answers a
+      join rounds rd on rd.id = a.round_id
+      join rooms  rm on rm.id = a.room_id
+     where rd.status = 'revealed'
+       and rm.counts_for_history
+       and (p_game is null or rd.game = p_game)
+  ), s as (
+    select p.id, p.name,
+           coalesce(sum(x.points), 0)::int              as pts,
+           count(x.*) filter (where x.is_correct)::int  as ok,
+           count(distinct x.room_id)::int               as salas
+      from participants p
+      left join played x on x.participant_id = p.id
+     group by p.id, p.name
+  )
+  select id, name, pts, ok, salas, (rank() over (order by pts desc))::int
+    from s order by pts desc, name;
+$$;
+
 create or replace function public.lookup_room(p_code text) returns json
 language plpgsql stable security definer set search_path = public as $$
 declare r rooms;
@@ -432,6 +688,7 @@ language plpgsql security definer set search_path = public as $$
 declare
   t player_tokens; r rooms; rd rounds; a answers;
   v_points int; v_rank int; v_players int; v_attempts int := 0; v_show boolean;
+  v_team json; v_secret json; v_round_team json; v_describer text; v_mine boolean := false;
 begin
   select * into t from player_tokens where token = p_token;
   if not found then return null; end if;
@@ -453,19 +710,40 @@ begin
   end if;
   v_show := rd.game = 'emoji' or rd.status = 'revealed';
 
+  select json_build_object('id', tm.id, 'name', tm.name, 'seq', tm.seq) into v_team
+    from team_members m join teams tm on tm.id = m.team_id
+   where m.room_id = t.room_id and m.participant_id = t.participant_id;
+
+  if rd.id is not null and rd.game = 'taboo' then
+    select json_build_object('id', tm.id, 'name', tm.name, 'seq', tm.seq) into v_round_team
+      from teams tm where tm.id = rd.team_id;
+    select p.name into v_describer from participants p where p.id = rd.describer_id;
+    v_mine := exists (select 1 from team_members m
+                       where m.team_id = rd.team_id and m.participant_id = t.participant_id);
+    -- La palabra solo viaja al celular de quien describe (o a todos al revelar).
+    if t.participant_id = rd.describer_id or rd.status = 'revealed' then
+      select json_build_object('word', ti.word, 'forbidden', ti.forbidden, 'reference', ti.reference)
+        into v_secret from taboo_items ti where ti.id = rd.item_id;
+    end if;
+  end if;
+
   return json_build_object(
     'server_now', clock_timestamp(),
     'room', json_build_object('id', r.id, 'name', r.name, 'status', r.status, 'view', r.view),
     'me', json_build_object(
       'participant_id', t.participant_id,
       'name', (select name from participants where id = t.participant_id),
-      'points', coalesce(v_points, 0), 'rank', v_rank, 'players', v_players),
+      'points', coalesce(v_points, 0), 'rank', v_rank, 'players', v_players,
+      'team', v_team),
     'round', case when rd.id is null then null else json_build_object(
       'id', rd.id, 'game', rd.game, 'difficulty', rd.difficulty, 'seq', rd.seq, 'status', rd.status,
       'clues_total', rd.clues_total, 'clues_revealed', rd.clues_revealed,
       'prompt', rd.prompt, 'options', rd.options,
       'started_at', rd.started_at, 'deadline', rd.deadline,
-      'answer_text', rd.answer_text, 'correct_index', rd.correct_index) end,
+      'answer_text', rd.answer_text, 'correct_index', rd.correct_index,
+      'team', v_round_team, 'describer_id', rd.describer_id, 'describer_name', v_describer,
+      'my_turn', v_mine, 'i_describe', rd.describer_id = t.participant_id,
+      'secret', v_secret) end,
     'my_answer', case when a.id is null then null else json_build_object(
       'choice', a.choice, 'answer_text', a.answer_text,
       'is_correct', case when v_show then a.is_correct end,
@@ -562,6 +840,9 @@ alter table public.room_players   enable row level security;
 alter table public.player_tokens  enable row level security;
 alter table public.rounds         enable row level security;
 alter table public.answers        enable row level security;
+alter table public.taboo_items    enable row level security;
+alter table public.teams          enable row level security;
+alter table public.team_members   enable row level security;
 
 drop policy if exists admins_self on public.admins;
 create policy admins_self on public.admins for select to authenticated using (user_id = auth.uid());
@@ -576,6 +857,19 @@ create policy emoji_admin on public.emoji_items for all to authenticated using (
 
 drop policy if exists quiz_admin on public.quiz_questions;
 create policy quiz_admin on public.quiz_questions for all to authenticated using (is_admin()) with check (is_admin());
+
+drop policy if exists taboo_admin on public.taboo_items;
+create policy taboo_admin on public.taboo_items for all to authenticated using (is_admin()) with check (is_admin());
+
+drop policy if exists teams_read on public.teams;
+create policy teams_read on public.teams for select to anon, authenticated using (true);
+drop policy if exists teams_admin on public.teams;
+create policy teams_admin on public.teams for all to authenticated using (is_admin()) with check (is_admin());
+
+drop policy if exists team_members_read on public.team_members;
+create policy team_members_read on public.team_members for select to anon, authenticated using (true);
+drop policy if exists team_members_admin on public.team_members;
+create policy team_members_admin on public.team_members for all to authenticated using (is_admin()) with check (is_admin());
 
 drop policy if exists rooms_read on public.rooms;
 create policy rooms_read on public.rooms for select to anon, authenticated using (true);
@@ -600,22 +894,32 @@ create policy answers_admin on public.answers for all to authenticated using (is
 -- player_tokens: sin políticas → solo accesible desde funciones security definer
 
 grant usage on schema public to anon, authenticated;
-grant select on public.participants, public.rooms, public.room_players, public.rounds to anon;
+grant select on public.participants, public.rooms, public.room_players, public.rounds,
+  public.teams, public.team_members to anon;
 grant select, insert, update, delete on
-  public.participants, public.emoji_items, public.quiz_questions, public.rooms,
-  public.room_codes, public.room_players, public.rounds, public.answers to authenticated;
+  public.participants, public.emoji_items, public.quiz_questions, public.taboo_items, public.rooms,
+  public.room_codes, public.room_players, public.rounds, public.answers,
+  public.teams, public.team_members to authenticated;
 grant select on public.admins to authenticated;
 revoke all on public.player_tokens from anon, authenticated;
 
 revoke execute on function public.create_room(text), public.reveal_round(uuid, boolean), public.start_round(uuid, text, text),
   public.reveal_clue(uuid), public.set_room_view(uuid, text), public.close_room(uuid),
-  public.release_player(uuid, uuid), public.room_players_status(uuid), public.claim_admin() from anon, public;
+  public.release_player(uuid, uuid), public.room_players_status(uuid), public.claim_admin(),
+  public.assign_teams(uuid, int), public.set_team(uuid, uuid, uuid), public.rename_team(uuid, text),
+  public.start_taboo_round(uuid, text, uuid), public.start_taboo_timer(uuid),
+  public.stop_taboo(uuid, boolean) from anon, public;
 grant execute on function public.create_room(text), public.reveal_round(uuid, boolean), public.start_round(uuid, text, text),
   public.reveal_clue(uuid), public.set_room_view(uuid, text), public.close_room(uuid),
-  public.release_player(uuid, uuid), public.room_players_status(uuid), public.claim_admin() to authenticated;
+  public.release_player(uuid, uuid), public.room_players_status(uuid), public.claim_admin(),
+  public.assign_teams(uuid, int), public.set_team(uuid, uuid, uuid), public.rename_team(uuid, text),
+  public.start_taboo_round(uuid, text, uuid), public.start_taboo_timer(uuid),
+  public.stop_taboo(uuid, boolean) to authenticated;
 grant execute on function public.server_now(), public.room_scoreboard(uuid, text), public.lookup_room(text),
   public.join_room(text, uuid), public.player_state(uuid), public.submit_emoji(uuid, uuid, text),
-  public.submit_quiz(uuid, uuid, int), public.is_admin() to anon, authenticated;
+  public.submit_quiz(uuid, uuid, int), public.is_admin(),
+  public.room_team_scoreboard(uuid), public.room_teams(uuid),
+  public.global_scoreboard(text) to anon, authenticated;
 
 -- ---------------------------------------------------------------------
 -- REALTIME
@@ -623,7 +927,7 @@ grant execute on function public.server_now(), public.room_scoreboard(uuid, text
 do $$
 declare tbl text;
 begin
-  foreach tbl in array array['rooms','rounds','room_players','answers'] loop
+  foreach tbl in array array['rooms','rounds','room_players','answers','teams','team_members'] loop
     if not exists (select 1 from pg_publication_tables
                     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = tbl) then
       execute format('alter publication supabase_realtime add table public.%I', tbl);
@@ -728,5 +1032,50 @@ insert into public.quiz_questions (difficulty, question, options, correct_index,
 ('dificil', '¿Quién fue la madre del profeta Samuel?', array['Penina','Noemí','Ana','Elisabet'], 2, '1 Samuel 1:20'),
 ('dificil', '¿Qué edad tenía Abraham cuando nació Isaac?', array['75','86','99','100'], 3, 'Génesis 21:5'),
 ('dificil', '¿Qué juez de Israel hizo un voto que afectó a su hija?', array['Jefté','Gedeón','Sansón','Aod'], 0, 'Jueces 11:30-40');
+end if;
+end $$;
+
+do $$ begin
+if not exists (select 1 from public.taboo_items) then
+insert into public.taboo_items (difficulty, word, forbidden, reference) values
+-- FÁCIL
+('facil', 'El arca de Noé', array['noé','diluvio','animales','lluvia','barco'], 'Génesis 6–9'),
+('facil', 'David y Goliat', array['honda','piedra','gigante','filisteo','frente'], '1 Samuel 17'),
+('facil', 'La última cena', array['pan','vino','discípulos','mesa','jesús'], 'Lucas 22:14-20'),
+('facil', 'La zarza ardiente', array['moisés','fuego','arbusto','horeb','arder'], 'Éxodo 3'),
+('facil', 'Jonás y el gran pez', array['ballena','nínive','tragar','mar','tres días'], 'Jonás 1–2'),
+('facil', 'El pesebre', array['belén','jesús','nacimiento','establo','paja'], 'Lucas 2:7'),
+('facil', 'Daniel en el foso de los leones', array['leones','foso','oración','darío','fieras'], 'Daniel 6'),
+('facil', 'El arco iris', array['noé','promesa','colores','lluvia','cielo'], 'Génesis 9:13'),
+('facil', 'Adán y Eva', array['edén','fruto','serpiente','costilla','jardín'], 'Génesis 2–3'),
+('facil', 'Los Diez Mandamientos', array['moisés','sinaí','tablas','ley','diez'], 'Éxodo 20'),
+('facil', 'El maná', array['desierto','pan','cielo','israelitas','comida'], 'Éxodo 16'),
+('facil', 'La cruz', array['jesús','calvario','madero','crucificar','clavos'], 'Juan 19:17-18'),
+-- INTERMEDIO
+('intermedio', 'La torre de Babel', array['idiomas','lenguas','babel','construir','confusión'], 'Génesis 11:1-9'),
+('intermedio', 'Sansón y Dalila', array['cabello','fuerza','filisteos','tijeras','columnas'], 'Jueces 16'),
+('intermedio', 'La reina Ester', array['persia','judíos','amán','rey','asuero'], 'Ester 1–10'),
+('intermedio', 'El buen samaritano', array['camino','herido','ayudar','jericó','vendas'], 'Lucas 10:25-37'),
+('intermedio', 'Los muros de Jericó', array['trompetas','josué','vueltas','murallas','caer'], 'Josué 6'),
+('intermedio', 'La multiplicación de los panes', array['peces','cinco mil','milagro','canastas','multitud'], 'Juan 6:1-14'),
+('intermedio', 'El hijo pródigo', array['padre','herencia','cerdos','regresar','fiesta'], 'Lucas 15:11-32'),
+('intermedio', 'La escalera de Jacob', array['sueño','ángeles','cielo','betel','piedra'], 'Génesis 28:10-22'),
+('intermedio', 'Elías en el monte Carmelo', array['fuego','baal','altar','profetas','lluvia'], '1 Reyes 18'),
+('intermedio', 'El bautismo de Jesús', array['juan','jordán','agua','paloma','río'], 'Mateo 3:13-17'),
+('intermedio', 'La transfiguración', array['monte','moisés','elías','resplandor','nube'], 'Mateo 17:1-8'),
+('intermedio', 'Rut y Noemí', array['moab','espigas','booz','suegra','cosecha'], 'Rut 1–4'),
+-- DIFÍCIL
+('dificil', 'Nehemías', array['muro','jerusalén','copero','reconstruir','artajerjes'], 'Nehemías 1–6'),
+('dificil', 'El becerro de oro', array['aarón','ídolo','sinaí','oro','adorar'], 'Éxodo 32'),
+('dificil', 'La burra de Balaam', array['ángel','hablar','animal','camino','espada'], 'Números 22:21-35'),
+('dificil', 'El valle de los huesos secos', array['ezequiel','visión','huesos','vida','profetizar'], 'Ezequiel 37:1-14'),
+('dificil', 'Melquisedec', array['sacerdote','salem','pan','abraham','diezmo'], 'Génesis 14:18-20'),
+('dificil', 'La escritura en la pared', array['belsasar','mano','banquete','daniel','dedos'], 'Daniel 5'),
+('dificil', 'Pentecostés', array['espíritu','lenguas','fuego','apóstoles','viento'], 'Hechos 2'),
+('dificil', 'La serpiente de bronce', array['moisés','desierto','mirar','mordedura','asta'], 'Números 21:4-9'),
+('dificil', 'El arca del pacto', array['querubines','oro','tablas','sagrada','cofre'], 'Éxodo 25:10-22'),
+('dificil', 'Gedeón y los trescientos', array['madianitas','antorchas','trompetas','cántaros','vellón'], 'Jueces 7'),
+('dificil', 'El cordero pascual', array['sangre','puerta','egipto','muerte','ángel'], 'Éxodo 12'),
+('dificil', 'La conversión de Saulo', array['damasco','luz','ceguera','camino','ananías'], 'Hechos 9:1-19');
 end if;
 end $$;

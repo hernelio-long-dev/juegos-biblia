@@ -7,7 +7,10 @@ import { clearPlayerSession, getPlayerSession } from '../lib/player'
 import { useLiveRefresh } from '../lib/realtime'
 import { emojiPoints } from '../lib/scoring'
 import { errorMessage, playerClient, requestTimeout } from '../lib/supabase'
-import { EMOJI_FINAL_SECONDS, GAME_LABEL, OPTION_STYLES, QUIZ_SECONDS, type PlayerState } from '../lib/types'
+import {
+  EMOJI_FINAL_SECONDS, GAME_LABEL, OPTION_STYLES, QUIZ_SECONDS, TABOO_SECONDS, teamStyle,
+  type PlayerState,
+} from '../lib/types'
 
 type Round = NonNullable<PlayerState['round']>
 
@@ -54,6 +57,7 @@ export default function Play() {
   useLiveRefresh(roomId, [
     { table: 'rounds', filter: `room_id=eq.${roomId}` },
     { table: 'rooms', filter: `id=eq.${roomId}` },
+    { table: 'team_members', filter: `room_id=eq.${roomId}` },
   ], refresh, 3000, playerClient)
 
   useWakeLock()
@@ -89,7 +93,11 @@ export default function Play() {
         </div>
         <div className="min-w-0 flex-1">
           <div className="truncate font-bold">{me.name}</div>
-          <div className="truncate text-xs text-indigo-200">{room.name}</div>
+          {me.team ? (
+            <span className={`chip mt-0.5 px-2 py-0 text-xs ${teamStyle(me.team.seq).soft}`}>{me.team.name}</span>
+          ) : (
+            <div className="truncate text-xs text-indigo-200">{room.name}</div>
+          )}
         </div>
         <div className="text-right">
           <div className="font-display text-2xl font-bold leading-none text-amber-300 tabular-nums">{me.points}</div>
@@ -107,7 +115,9 @@ export default function Play() {
         ) : room.view === 'round' && round ? (
           round.game === 'emoji'
             ? <EmojiPlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
-            : <QuizPlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
+            : round.game === 'taboo'
+              ? <TabooPlay key={round.id} state={state} round={round} now={now} />
+              : <QuizPlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
         ) : (
           <InfoCard emoji="🙌" title={`¡Ya estás dentro, ${me.name.split(' ')[0]}!`} text="Espera a que el administrador inicie el juego. Mantén esta pantalla abierta.">
             <div className="mt-6 flex justify-center gap-2">
@@ -404,6 +414,116 @@ function QuizPlay({ state, round, token, now, refresh }: PlayProps) {
         <p className="mt-4 text-center font-bold text-rose-200">⏰ Tiempo terminado</p>
       ) : null}
     </div>
+  )
+}
+
+// ---------------------------------------------------------------- TABÚ BÍBLICO
+function TabooPlay({ state, round, now }: { state: PlayerState; round: Round; now: number }) {
+  const my = state.my_answer
+  const team = round.team
+  const style = teamStyle(team?.seq ?? 1)
+  const left = secondsLeft(round.deadline, now) ?? TABOO_SECONDS
+  const running = round.status === 'active'
+  const revealed = round.status === 'revealed'
+
+  useEffect(() => { if (running) vibrate(60) }, [running])
+  useEffect(() => { if (revealed && my?.is_correct) celebrate() }, [revealed, my?.is_correct])
+
+  if (revealed) {
+    return (
+      <div className="card animate-rise p-6 text-center">
+        <RoundHeader round={round} />
+        <p className="text-indigo-200">La palabra era</p>
+        <p className="mt-1 font-display text-4xl font-bold text-amber-300">{round.answer_text}</p>
+        {round.secret?.reference && <p className="mt-1 text-sm text-indigo-300">📖 {round.secret.reference}</p>}
+        {round.my_turn ? (
+          <ResultBanner
+            correct={my?.is_correct === true}
+            points={my?.points ?? 0}
+            answered={my !== null}
+            detail={my?.is_correct ? `Todo ${team?.name} suma estos puntos` : `${team?.name} no alcanzó a adivinar`}
+          />
+        ) : (
+          <p className="mt-5 rounded-2xl bg-white/10 px-4 py-4 text-indigo-100">
+            Le tocaba a <b>{team?.name}</b>. Prepárate, tu equipo puede ser el siguiente.
+          </p>
+        )}
+      </div>
+    )
+  }
+
+  // Quien describe: solo él recibe la palabra y las prohibidas.
+  if (round.i_describe && round.secret) {
+    return (
+      <div className="animate-rise">
+        <div className="card p-5 text-center">
+          <RoundHeader round={round} />
+          <p className="text-sm uppercase tracking-wider text-indigo-200">Te toca describir a ti</p>
+          <p className="mt-2 font-display text-5xl font-bold leading-tight text-amber-300">{round.secret.word}</p>
+          <div className="mt-5 rounded-2xl bg-rose-500/15 p-4 text-left">
+            <p className="text-sm font-bold uppercase tracking-wider text-rose-200">🚫 No puedes decir</p>
+            <ul className="mt-2 grid grid-cols-2 gap-1.5">
+              {round.secret.forbidden.map((w) => (
+                <li key={w} className="rounded-xl bg-rose-500/20 px-3 py-1.5 text-center font-bold text-rose-50 line-through">{w}</li>
+              ))}
+            </ul>
+          </div>
+          <p className="mt-3 text-sm text-indigo-300">Tampoco vale deletrear, hacer señas ni decir palabras parecidas.</p>
+        </div>
+        <div className="card mt-4 flex items-center justify-center gap-4 p-5">
+          {running ? (
+            <>
+              <CountdownRing seconds={left} total={TABOO_SECONDS} size={88} />
+              <p className="font-display text-2xl font-bold">¡Descríbela ya!</p>
+            </>
+          ) : (
+            <p className="text-center font-display text-xl text-indigo-200">
+              🤫 Memorízala. El administrador arrancará los {TABOO_SECONDS} segundos.
+            </p>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // Resto del equipo que juega.
+  if (round.my_turn) {
+    return (
+      <div className="card animate-rise p-8 text-center">
+        <RoundHeader round={round} />
+        <div className="animate-pop text-7xl">{running ? '📣' : '👂'}</div>
+        <h2 className="mt-3 font-display text-3xl font-bold">
+          {running ? '¡Adivina en voz alta!' : '¡Prepárate!'}
+        </h2>
+        <p className="mt-2 text-indigo-200">
+          <b className={style.text}>{round.describer_name}</b> {running ? 'está describiendo la palabra' : 'va a describir la palabra'}.
+        </p>
+        {running && (
+          <div className="mt-6 flex justify-center">
+            <CountdownRing seconds={left} total={TABOO_SECONDS} size={120} />
+          </div>
+        )}
+        <p className="mt-6 text-sm text-indigo-300">
+          No se responde por el celular: griten la respuesta y el administrador detendrá el tiempo.
+        </p>
+      </div>
+    )
+  }
+
+  // Los demás equipos miran.
+  return (
+    <InfoCard
+      emoji={running ? '⏳' : '🤫'}
+      title={`Le toca a ${team?.name ?? 'otro equipo'}`}
+      text={running
+        ? `${round.describer_name} está describiendo. Escucha en silencio: no ayudes ni respondas.`
+        : `${round.describer_name} está leyendo su palabra. Tu turno llegará pronto.`}
+    >
+      {running && <div className="mt-6 flex justify-center"><CountdownRing seconds={left} total={TABOO_SECONDS} size={96} /></div>}
+      {state.me.team && (
+        <p className="mt-6 text-sm text-indigo-300">Tú juegas con <b>{state.me.team.name}</b>.</p>
+      )}
+    </InfoCard>
   )
 }
 

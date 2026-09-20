@@ -1,6 +1,43 @@
-import type { ScoreRow } from '../lib/types'
+import { teamStyle, type ScoreRow, type TeamScoreRow } from '../lib/types'
 
 const MEDALS = ['🥇', '🥈', '🥉']
+
+/** Tabla por equipos (Tabú bíblico). */
+export function TeamLeaderboard({ rows, big = false }: { rows: TeamScoreRow[]; big?: boolean }) {
+  if (rows.length === 0) {
+    return <p className="py-8 text-center text-indigo-200">Todavía no hay equipos. Ármalos desde «🤝 Equipos».</p>
+  }
+  return (
+    <ol className="grid gap-3 sm:grid-cols-2">
+      {rows.map((row, i) => {
+        const style = teamStyle(row.seq)
+        const top = row.rank === 1 && row.points > 0
+        return (
+          <li
+            key={row.team_id}
+            style={{ animationDelay: `${Math.min(i, 10) * 60}ms` }}
+            className={`animate-rise flex items-center gap-4 rounded-2xl px-5 ${big ? 'py-5' : 'py-3'}
+              ${top ? 'bg-white/15 ring-2 ring-amber-300' : 'bg-white/[0.06]'}`}
+          >
+            <span className={`flex shrink-0 items-center justify-center rounded-2xl font-display font-bold text-white
+              ${style.bg} ${big ? 'h-14 w-14 text-3xl' : 'h-10 w-10 text-xl'}`}>
+              {row.seq}
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className={`truncate font-display font-bold ${big ? 'text-3xl' : 'text-lg'}`}>{row.name}</div>
+              <div className="text-xs text-indigo-300">
+                {row.members} {row.members === 1 ? 'integrante' : 'integrantes'} · {row.wins} {row.wins === 1 ? 'acierto' : 'aciertos'}
+              </div>
+            </div>
+            <span className={`font-display font-bold tabular-nums text-amber-300 ${big ? 'text-4xl' : 'text-2xl'}`}>
+              {row.points}
+            </span>
+          </li>
+        )
+      })}
+    </ol>
+  )
+}
 
 export function Leaderboard({ rows, big = false, highlightId, limit }: {
   rows: ScoreRow[]

@@ -44,6 +44,14 @@ export default function RoomsTab() {
     navigate(`/admin/sala/${data.id}`)
   }
 
+  async function toggleHistory(room: RoomRow) {
+    const next = !room.counts_for_history
+    if (!next && !confirm(`¿Excluir "${room.name}" del ranking histórico? Sus puntos dejan de sumar en el acumulado, pero no se borra nada y puedes volver a incluirla cuando quieras.`)) return
+    const { error } = await supabase.from('rooms').update({ counts_for_history: next }).eq('id', room.id)
+    if (error) return setError(errorMessage(error))
+    load()
+  }
+
   async function remove(room: RoomRow) {
     if (!confirm(`¿Eliminar la sala "${room.name}" y todos sus puntajes? Esta acción no se puede deshacer.`)) return
     const { error } = await supabase.from('rooms').delete().eq('id', room.id)
@@ -60,7 +68,10 @@ export default function RoomsTab() {
         </div>
         <button className="btn-primary" disabled={busy}>{busy ? 'Creando…' : '+ Crear sala'}</button>
       </form>
-      <p className="-mt-3 text-sm text-indigo-300">El sistema genera automáticamente un código de 4 dígitos para que los participantes entren.</p>
+      <p className="-mt-3 text-sm text-indigo-300">
+        El sistema genera automáticamente un código de 4 dígitos para que los participantes entren.
+        Toda sala suma al <b>ranking histórico</b>; desmarca una para dejarla fuera (útil en ensayos o pruebas).
+      </p>
 
       <ErrorBox>{error}</ErrorBox>
 
@@ -90,6 +101,17 @@ export default function RoomsTab() {
                     <span className="chip bg-white/10 text-indigo-200">Cerrada</span>
                   )}
                 </div>
+                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 accent-amber-400"
+                    checked={r.counts_for_history}
+                    onChange={() => toggleHistory(r)}
+                  />
+                  <span className={r.counts_for_history ? 'text-indigo-200' : 'text-amber-200'}>
+                    {r.counts_for_history ? '🏅 Cuenta para el histórico' : '🚫 Excluida del histórico'}
+                  </span>
+                </label>
                 <div className="flex gap-2">
                   <button className="btn-primary flex-1" onClick={() => navigate(`/admin/sala/${r.id}`)}>
                     {r.status === 'open' ? 'Abrir consola' : 'Ver resultados'}

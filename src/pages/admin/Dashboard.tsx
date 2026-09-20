@@ -5,12 +5,16 @@ import RoomsTab from './RoomsTab'
 import ParticipantsTab from './ParticipantsTab'
 import EmojiBankTab from './EmojiBankTab'
 import QuizBankTab from './QuizBankTab'
+import TabooBankTab from './TabooBankTab'
+import HistoryTab from './HistoryTab'
 
 const TABS = [
   { id: 'salas', label: 'Salas', icon: '🏠' },
+  { id: 'historico', label: 'Histórico', icon: '🏅' },
   { id: 'participantes', label: 'Participantes', icon: '👥' },
   { id: 'emojis', label: 'Banco de emojis', icon: '😀' },
   { id: 'preguntas', label: 'Banco de preguntas', icon: '❓' },
+  { id: 'taboo', label: 'Banco de Tabú', icon: '🤫' },
 ] as const
 
 export default function AdminDashboard() {
@@ -39,9 +43,11 @@ export default function AdminDashboard() {
 
       <div className="mt-6">
         {tab === 'salas' && <RoomsTab />}
+        {tab === 'historico' && <HistoryTab />}
         {tab === 'participantes' && <ParticipantsTab />}
         {tab === 'emojis' && <EmojiBankTab />}
         {tab === 'preguntas' && <QuizBankTab />}
+        {tab === 'taboo' && <TabooBankTab />}
       </div>
     </div>
   )
