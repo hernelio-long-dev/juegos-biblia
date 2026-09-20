@@ -44,6 +44,23 @@ create table if not exists public.quiz_questions (
   created_at    timestamptz not null default now()
 );
 
+-- Código Secreto Bíblico: cada ítem trae el código a descifrar y el versículo que lo confirma.
+create table if not exists public.cipher_items (
+  id            uuid primary key default gen_random_uuid(),
+  difficulty    text not null check (difficulty in ('facil','intermedio','dificil')),
+  kind          text not null check (kind in ('numeros','reverso','anagrama','desplazado','sin_vocales','acertijo','frase')),
+  puzzle        text not null,
+  hint          text,
+  answer        text not null,
+  aliases       text[] not null default '{}',
+  verse_prompt  text not null,
+  verse_book    text not null,
+  verse_chapter int  not null check (verse_chapter > 0),
+  verse_from    int  not null check (verse_from > 0),
+  verse_to      int,
+  created_at    timestamptz not null default now()
+);
+
 create table if not exists public.taboo_items (
   id         uuid primary key default gen_random_uuid(),
   difficulty text not null check (difficulty in ('facil','intermedio','dificil')),
@@ -111,7 +128,7 @@ alter table public.team_members replica identity full;
 create table if not exists public.rounds (
   id             uuid primary key default gen_random_uuid(),
   room_id        uuid not null references public.rooms(id) on delete cascade,
-  game           text not null check (game in ('emoji','quiz','taboo')),
+  game           text not null check (game in ('emoji','quiz','taboo','cipher')),
   difficulty     text not null check (difficulty in ('facil','intermedio','dificil')),
   item_id        uuid not null,
   seq            int  not null,
@@ -144,7 +161,7 @@ do $$ begin
   alter table public.rounds add column if not exists team_id uuid;
   alter table public.rounds add column if not exists describer_id uuid;
   alter table public.rounds drop constraint if exists rounds_game_check;
-  alter table public.rounds add  constraint rounds_game_check   check (game in ('emoji','quiz','taboo'));
+  alter table public.rounds add  constraint rounds_game_check   check (game in ('emoji','quiz','taboo','cipher'));
   alter table public.rounds drop constraint if exists rounds_status_check;
   alter table public.rounds add  constraint rounds_status_check check (status in ('pending','active','revealed'));
   if not exists (select 1 from pg_constraint where conname = 'rounds_team_fk') then
@@ -168,12 +185,25 @@ create table if not exists public.answers (
   points         int not null default 0,
   clue_number    int,
   elapsed_ms     int,
+  -- Código Secreto: 2ª fase. `points` guarda el total (código + bono del versículo).
+  verse_text     text,
+  verse_ok       boolean,
+  verse_points   int not null default 0,
+  verse_tries    int not null default 0,
   created_at     timestamptz not null default now()
 );
 create index if not exists answers_room_idx on public.answers(room_id);
 create index if not exists answers_round_idx on public.answers(round_id);
 create unique index if not exists answers_one_correct on public.answers(round_id, participant_id) where is_correct;
 create unique index if not exists answers_one_choice  on public.answers(round_id, participant_id) where choice is not null;
+
+-- Actualiza bases creadas antes del «Código Secreto Bíblico».
+do $$ begin
+  alter table public.answers add column if not exists verse_text   text;
+  alter table public.answers add column if not exists verse_ok     boolean;
+  alter table public.answers add column if not exists verse_points int not null default 0;
+  alter table public.answers add column if not exists verse_tries  int not null default 0;
+end $$;
 
 -- ---------------------------------------------------------------------
 -- UTILIDADES
@@ -262,6 +292,24 @@ language sql immutable as $$
        + greatest(0, least(20, floor((20000 - p_elapsed_ms) / 1000.0)))::int
 $$;
 
+-- Código Secreto — descifrar: 20 base + 1 punto por cada segundo que sobre de los 60, × nivel.
+create or replace function public.cipher_points(p_difficulty text, p_elapsed_ms int) returns int
+language sql immutable as $$
+  select round(
+    (20 + 1.0 * greatest(0, least(60, 60 - p_elapsed_ms / 1000.0)))
+    * (case p_difficulty when 'dificil' then 2.0 when 'intermedio' then 1.5 else 1.0 end)
+  )::int
+$$;
+
+-- Código Secreto — bono bíblico: 10 base + 0.5 por cada segundo que sobre de los 60, × nivel.
+create or replace function public.verse_points(p_difficulty text, p_elapsed_ms int) returns int
+language sql immutable as $$
+  select round(
+    (10 + 0.5 * greatest(0, least(60, 60 - p_elapsed_ms / 1000.0)))
+    * (case p_difficulty when 'dificil' then 2.0 when 'intermedio' then 1.5 else 1.0 end)
+  )::int
+$$;
+
 -- Tabú: 30 base + 1.5 puntos por cada segundo que sobre de los 45,
 -- todo × nivel (fácil 1, intermedio 1.5, difícil 2). Lo ganan todos los del equipo.
 create or replace function public.taboo_points(p_difficulty text, p_elapsed_ms int) returns int
@@ -314,17 +362,39 @@ begin
   if rd.status = 'pending' and not p_force then return false; end if;
 
   if not p_force then
-    select count(*) into v_players from room_players where room_id = rd.room_id;
-    select count(distinct participant_id), count(*) filter (where is_correct)
-      into v_answered, v_correct
-      from answers where round_id = rd.id;
-    if not (
-      (rd.deadline is not null and clock_timestamp() >= rd.deadline)
-      or (clock_timestamp() >= rd.started_at and v_players > 0 and (
-            (rd.game = 'quiz'  and v_answered >= v_players)
-         or (rd.game = 'emoji' and v_correct  >= v_players)))
-    ) then
-      return false;
+    if rd.game = 'cipher' then
+      -- La ventana del versículo es personal (60 s desde que cada uno descifra),
+      -- así que la ronda solo se cierra cuando ya nadie puede seguir jugando.
+      if exists (
+        select 1 from room_players rp
+         where rp.room_id = rd.room_id
+           and not exists (select 1 from answers a
+                            where a.round_id = rd.id and a.participant_id = rp.participant_id
+                              and a.is_correct and a.verse_ok is not null)
+           and ( (clock_timestamp() < rd.deadline
+                  and not exists (select 1 from answers a
+                                   where a.round_id = rd.id and a.participant_id = rp.participant_id
+                                     and a.is_correct))
+              or exists (select 1 from answers a
+                          where a.round_id = rd.id and a.participant_id = rp.participant_id
+                            and a.is_correct
+                            and clock_timestamp() < a.created_at + interval '60 seconds') )
+      ) then
+        return false;
+      end if;
+    else
+      select count(*) into v_players from room_players where room_id = rd.room_id;
+      select count(distinct participant_id), count(*) filter (where is_correct)
+        into v_answered, v_correct
+        from answers where round_id = rd.id;
+      if not (
+        (rd.deadline is not null and clock_timestamp() >= rd.deadline)
+        or (clock_timestamp() >= rd.started_at and v_players > 0 and (
+              (rd.game = 'quiz'  and v_answered >= v_players)
+           or (rd.game = 'emoji' and v_correct  >= v_players)))
+      ) then
+        return false;
+      end if;
     end if;
   end if;
 
@@ -332,8 +402,9 @@ begin
     status = 'revealed',
     revealed_at = clock_timestamp(),
     answer_text = case r.game
-      when 'emoji' then (select e.answer from emoji_items e where e.id = r.item_id)
-      when 'taboo' then (select ti.word from taboo_items ti where ti.id = r.item_id)
+      when 'emoji'  then (select e.answer from emoji_items e where e.id = r.item_id)
+      when 'taboo'  then (select ti.word from taboo_items ti where ti.id = r.item_id)
+      when 'cipher' then (select ci.answer from cipher_items ci where ci.id = r.item_id)
       else (select q.options[q.correct_index + 1] from quiz_questions q where q.id = r.item_id) end,
     correct_index = case when r.game = 'quiz'
       then (select q.correct_index from quiz_questions q where q.id = r.item_id) end,
@@ -344,7 +415,7 @@ end $$;
 
 create or replace function public.start_round(p_room uuid, p_game text, p_difficulty text) returns uuid
 language plpgsql security definer set search_path = public as $$
-declare v_seq int; v_id uuid; v_old uuid; e emoji_items; q quiz_questions;
+declare v_seq int; v_id uuid; v_old uuid; e emoji_items; q quiz_questions; ci cipher_items;
 begin
   if not is_admin() then raise exception 'No autorizado'; end if;
   if not exists (select 1 from rooms where id = p_room and status = 'open') then
@@ -374,6 +445,17 @@ begin
     insert into rounds(room_id, game, difficulty, item_id, seq, prompt, options, started_at, deadline)
     values (p_room, 'quiz', q.difficulty, q.id, v_seq, q.question, q.options,
             clock_timestamp() + interval '3 seconds', clock_timestamp() + interval '23 seconds')
+    returning id into v_id;
+  elsif p_game = 'cipher' then
+    select * into ci from cipher_items it
+     where it.difficulty = p_difficulty
+       and not exists (select 1 from rounds r where r.room_id = p_room and r.item_id = it.id)
+     order by random() limit 1;
+    if not found then raise exception 'Ya no quedan códigos de nivel % en esta sala', p_difficulty; end if;
+    -- 60 s para descifrar; el cronómetro del versículo es personal y arranca al acertar.
+    insert into rounds(room_id, game, difficulty, item_id, seq, started_at, deadline)
+    values (p_room, 'cipher', ci.difficulty, ci.id, v_seq, clock_timestamp(),
+            clock_timestamp() + interval '60 seconds')
     returning id into v_id;
   else
     raise exception 'Juego desconocido';
@@ -689,6 +771,7 @@ declare
   t player_tokens; r rooms; rd rounds; a answers;
   v_points int; v_rank int; v_players int; v_attempts int := 0; v_show boolean;
   v_team json; v_secret json; v_round_team json; v_describer text; v_mine boolean := false;
+  v_cipher json; v_verse json;
 begin
   select * into t from player_tokens where token = p_token;
   if not found then return null; end if;
@@ -708,7 +791,22 @@ begin
      order by is_correct desc, created_at desc limit 1;
     select count(*) into v_attempts from answers where round_id = rd.id and participant_id = t.participant_id;
   end if;
-  v_show := rd.game = 'emoji' or rd.status = 'revealed';
+  -- El código se confirma al instante; el versículo y la respuesta, al revelar.
+  v_show := rd.game in ('emoji','cipher') or rd.status = 'revealed';
+
+  if rd.id is not null and rd.game = 'cipher' then
+    select json_build_object('kind', ci.kind, 'puzzle', ci.puzzle, 'hint', ci.hint)
+      into v_cipher from cipher_items ci where ci.id = rd.item_id;
+    -- La consigna del versículo delata la respuesta: solo va a quien ya descifró.
+    if a.is_correct or rd.status = 'revealed' then
+      select json_build_object(
+               'prompt', ci.verse_prompt,
+               'reference', case when rd.status = 'revealed'
+                 then ci.verse_book || ' ' || ci.verse_chapter || ':' || ci.verse_from
+                      || case when ci.verse_to is not null then '-' || ci.verse_to else '' end end)
+        into v_verse from cipher_items ci where ci.id = rd.item_id;
+    end if;
+  end if;
 
   select json_build_object('id', tm.id, 'name', tm.name, 'seq', tm.seq) into v_team
     from team_members m join teams tm on tm.id = m.team_id
@@ -743,12 +841,14 @@ begin
       'answer_text', rd.answer_text, 'correct_index', rd.correct_index,
       'team', v_round_team, 'describer_id', rd.describer_id, 'describer_name', v_describer,
       'my_turn', v_mine, 'i_describe', rd.describer_id = t.participant_id,
-      'secret', v_secret) end,
+      'secret', v_secret, 'cipher', v_cipher, 'verse', v_verse) end,
     'my_answer', case when a.id is null then null else json_build_object(
       'choice', a.choice, 'answer_text', a.answer_text,
       'is_correct', case when v_show then a.is_correct end,
       'points', case when v_show then a.points end,
       'clue_number', a.clue_number,
+      'verse_ok', a.verse_ok, 'verse_points', a.verse_points, 'verse_tries', a.verse_tries,
+      'verse_deadline', case when a.is_correct then a.created_at + interval '60 seconds' end,
       'attempts', v_attempts) end
   );
 end $$;
@@ -826,6 +926,91 @@ begin
   return json_build_object('ok', true);
 end $$;
 
+-- CÓDIGO SECRETO — 1ª fase: descifrar el código.
+create or replace function public.submit_cipher(p_token uuid, p_round uuid, p_text text) returns json
+language plpgsql security definer set search_path = public as $$
+declare
+  t player_tokens; rd rounds; ci cipher_items; v_ok boolean; v_pts int;
+  v_attempts int; v_text text; v_elapsed int;
+begin
+  select * into t from player_tokens where token = p_token;
+  if not found then raise exception 'Sesión inválida'; end if;
+  select * into rd from rounds where id = p_round and room_id = t.room_id and game = 'cipher';
+  if not found then raise exception 'Ronda no válida'; end if;
+
+  if rd.status <> 'active' or (select current_round_id from rooms where id = t.room_id) is distinct from rd.id then
+    return json_build_object('ok', false, 'reason', 'closed');
+  end if;
+  if clock_timestamp() > rd.deadline + interval '1 second' then
+    return json_build_object('ok', false, 'reason', 'timeout');
+  end if;
+  if exists (select 1 from answers where round_id = rd.id and participant_id = t.participant_id and is_correct) then
+    return json_build_object('ok', true, 'correct', true, 'already', true);
+  end if;
+  select count(*) into v_attempts from answers where round_id = rd.id and participant_id = t.participant_id;
+  if v_attempts >= 12 then return json_build_object('ok', false, 'reason', 'max_attempts'); end if;
+
+  v_text := left(trim(coalesce(p_text, '')), 80);
+  if v_text = '' then return json_build_object('ok', false, 'reason', 'empty'); end if;
+
+  select * into ci from cipher_items where id = rd.item_id;
+  v_ok := answer_matches(v_text, array_prepend(ci.answer, ci.aliases));
+  v_elapsed := greatest(0, (extract(epoch from clock_timestamp() - rd.started_at) * 1000)::int);
+  v_pts := case when v_ok then cipher_points(rd.difficulty, v_elapsed) else 0 end;
+
+  insert into answers(round_id, room_id, participant_id, answer_text, is_correct, points, elapsed_ms)
+  values (rd.id, t.room_id, t.participant_id, v_text, v_ok, v_pts, v_elapsed)
+  on conflict do nothing;
+
+  return json_build_object('ok', true, 'correct', v_ok, 'points', v_pts);
+end $$;
+
+-- CÓDIGO SECRETO — 2ª fase: confirmar en la Biblia. Cada quien tiene 60 s
+-- desde que acertó el código, no desde que empezó la ronda.
+create or replace function public.submit_verse(p_token uuid, p_round uuid,
+  p_book text, p_chapter int, p_verse int) returns json
+language plpgsql security definer set search_path = public as $$
+declare
+  t player_tokens; rd rounds; ci cipher_items; a answers; v_ok boolean; v_pts int; v_elapsed int;
+begin
+  select * into t from player_tokens where token = p_token;
+  if not found then raise exception 'Sesión inválida'; end if;
+  select * into rd from rounds where id = p_round and room_id = t.room_id and game = 'cipher';
+  if not found then raise exception 'Ronda no válida'; end if;
+  if rd.status = 'revealed' then return json_build_object('ok', false, 'reason', 'closed'); end if;
+
+  select * into a from answers
+   where round_id = rd.id and participant_id = t.participant_id and is_correct;
+  if not found then return json_build_object('ok', false, 'reason', 'not_solved'); end if;
+  if a.verse_ok is not null then return json_build_object('ok', false, 'reason', 'already'); end if;
+  if clock_timestamp() > a.created_at + interval '61 seconds' then
+    return json_build_object('ok', false, 'reason', 'timeout');
+  end if;
+  if a.verse_tries >= 5 then return json_build_object('ok', false, 'reason', 'max_attempts'); end if;
+  if p_chapter is null or p_verse is null or p_chapter < 1 or p_verse < 1 then
+    return json_build_object('ok', false, 'reason', 'empty');
+  end if;
+
+  select * into ci from cipher_items where id = rd.item_id;
+  v_ok := norm_text(p_book) = norm_text(ci.verse_book)
+      and p_chapter = ci.verse_chapter
+      and p_verse between ci.verse_from and coalesce(ci.verse_to, ci.verse_from);
+
+  if not v_ok then
+    update answers set verse_tries = verse_tries + 1 where id = a.id;
+    return json_build_object('ok', true, 'correct', false, 'tries', a.verse_tries + 1);
+  end if;
+
+  v_elapsed := greatest(0, (extract(epoch from clock_timestamp() - a.created_at) * 1000)::int);
+  v_pts := verse_points(rd.difficulty, v_elapsed);
+  update answers set verse_ok = true, verse_points = v_pts, verse_tries = verse_tries + 1,
+                     verse_text = left(trim(coalesce(p_book,'')), 40) || ' ' || p_chapter || ':' || p_verse,
+                     points = points + v_pts
+   where id = a.id;
+
+  return json_build_object('ok', true, 'correct', true, 'points', v_pts);
+end $$;
+
 -- ---------------------------------------------------------------------
 -- SEGURIDAD (RLS)
 -- ---------------------------------------------------------------------
@@ -841,6 +1026,7 @@ alter table public.player_tokens  enable row level security;
 alter table public.rounds         enable row level security;
 alter table public.answers        enable row level security;
 alter table public.taboo_items    enable row level security;
+alter table public.cipher_items   enable row level security;
 alter table public.teams          enable row level security;
 alter table public.team_members   enable row level security;
 
@@ -857,6 +1043,9 @@ create policy emoji_admin on public.emoji_items for all to authenticated using (
 
 drop policy if exists quiz_admin on public.quiz_questions;
 create policy quiz_admin on public.quiz_questions for all to authenticated using (is_admin()) with check (is_admin());
+
+drop policy if exists cipher_admin on public.cipher_items;
+create policy cipher_admin on public.cipher_items for all to authenticated using (is_admin()) with check (is_admin());
 
 drop policy if exists taboo_admin on public.taboo_items;
 create policy taboo_admin on public.taboo_items for all to authenticated using (is_admin()) with check (is_admin());
@@ -897,7 +1086,8 @@ grant usage on schema public to anon, authenticated;
 grant select on public.participants, public.rooms, public.room_players, public.rounds,
   public.teams, public.team_members to anon;
 grant select, insert, update, delete on
-  public.participants, public.emoji_items, public.quiz_questions, public.taboo_items, public.rooms,
+  public.participants, public.emoji_items, public.quiz_questions, public.taboo_items,
+  public.cipher_items, public.rooms,
   public.room_codes, public.room_players, public.rounds, public.answers,
   public.teams, public.team_members to authenticated;
 grant select on public.admins to authenticated;
@@ -918,6 +1108,7 @@ grant execute on function public.create_room(text), public.reveal_round(uuid, bo
 grant execute on function public.server_now(), public.room_scoreboard(uuid, text), public.lookup_room(text),
   public.join_room(text, uuid), public.player_state(uuid), public.submit_emoji(uuid, uuid, text),
   public.submit_quiz(uuid, uuid, int), public.is_admin(),
+  public.submit_cipher(uuid, uuid, text), public.submit_verse(uuid, uuid, text, int, int),
   public.room_team_scoreboard(uuid), public.room_teams(uuid),
   public.global_scoreboard(text) to anon, authenticated;
 
@@ -1077,5 +1268,86 @@ insert into public.taboo_items (difficulty, word, forbidden, reference) values
 ('dificil', 'Gedeón y los trescientos', array['madianitas','antorchas','trompetas','cántaros','vellón'], 'Jueces 7'),
 ('dificil', 'El cordero pascual', array['sangre','puerta','egipto','muerte','ángel'], 'Éxodo 12'),
 ('dificil', 'La conversión de Saulo', array['damasco','luz','ceguera','camino','ananías'], 'Hechos 9:1-19');
+end if;
+end $$;
+
+do $$ begin
+if not exists (select 1 from public.cipher_items) then
+insert into public.cipher_items (difficulty, kind, puzzle, hint, answer, aliases, verse_prompt, verse_book, verse_chapter, verse_from) values
+-- FÁCIL
+('facil','numeros','10 - 15 - 14 - 1 - 19','A = 1, B = 2, C = 3… hasta Z = 26','Jonás','{jonas}',
+ 'Encuentra el versículo donde Jehová prepara un gran pez para que se trague a Jonás.','Jonás',1,17),
+('facil','reverso','SESIOM','Léelo de derecha a izquierda.','Moisés','{moises}',
+ 'Encuentra el versículo donde la zarza arde en fuego y no se consume.','Éxodo',3,2),
+('facil','acertijo','«Mis hermanos me vendieron y terminé en Egipto.»','Piensa en un personaje del Génesis.','José','{jose,jose hijo de jacob}',
+ 'Encuentra el versículo donde sus hermanos lo venden por veinte piezas de plata.','Génesis',37,28),
+('facil','numeros','4 - 1 - 22 - 9 - 4','A = 1, B = 2, C = 3… hasta Z = 26','David','{rey david}',
+ 'Encuentra el versículo donde vence al filisteo con una honda y una piedra.','1 Samuel',17,50),
+('facil','reverso','EON','Léelo de derecha a izquierda.','Noé','{noe}',
+ 'Encuentra el versículo donde el arca reposa sobre los montes de Ararat.','Génesis',8,4),
+('facil','acertijo','«Me echaron al foso de los leones por seguir orando a mi Dios.»','Piensa en un profeta en Babilonia.','Daniel','{}',
+ 'Encuentra el versículo donde dice que Dios envió su ángel y cerró la boca de los leones.','Daniel',6,22),
+('facil','anagrama','NADA','Son las mismas letras, en otro orden.','Adán','{adan}',
+ 'Encuentra el versículo donde Dios forma al hombre del polvo de la tierra.','Génesis',2,7),
+('facil','numeros','16 - 5 - 4 - 18 - 15','A = 1, B = 2, C = 3… hasta Z = 26','Pedro','{simon pedro,cefas}',
+ 'Encuentra el versículo donde Jesús dice: «Tú eres Pedro, y sobre esta roca edificaré mi iglesia».','Mateo',16,18),
+('facil','acertijo','«Mi fuerza vivía en mi cabello.»','Piensa en un juez de Israel.','Sansón','{sanson}',
+ 'Encuentra el versículo donde le rapan las siete guedejas de su cabeza.','Jueces',16,19),
+('facil','reverso','NELEB','Léelo de derecha a izquierda.','Belén','{belen}',
+ 'Encuentra el versículo que anuncia que de Belén Efrata saldrá el que será Señor en Israel.','Miqueas',5,2),
+('facil','numeros','1 - 2 - 18 - 1 - 8 - 1 - 13','A = 1, B = 2, C = 3… hasta Z = 26','Abraham','{abram}',
+ 'Encuentra el versículo donde creyó a Jehová y le fue contado por justicia.','Génesis',15,6),
+('facil','acertijo','«Era bajito, así que me subí a un árbol para ver a Jesús.»','Piensa en un cobrador de impuestos.','Zaqueo','{}',
+ 'Encuentra el versículo donde Jesús le dice que se dé prisa y descienda.','Lucas',19,5),
+-- INTERMEDIO
+('intermedio','desplazado','FMJBT','Cada letra está una posición adelante en el alfabeto. Retrocede una.','Elías','{elias}',
+ 'Encuentra el versículo donde sube al cielo en un torbellino.','2 Reyes',2,11),
+('intermedio','anagrama','RESTE','Son las mismas letras, en otro orden.','Ester','{esther,reina ester}',
+ 'Encuentra el versículo donde le dicen: «¿Y quién sabe si para esta hora has llegado al reino?».','Ester',4,14),
+('intermedio','frase','TIERRA · LA · Y · LOS · CREÓ · DIOS · CIELOS · EN · EL · PRINCIPIO','Ordena las palabras para formar la frase.','En el principio creó Dios los cielos y la tierra','{en el principio creo dios los cielos y la tierra}',
+ 'Encuentra el versículo exacto donde está escrita esa frase.','Génesis',1,1),
+('intermedio','numeros','14 - 5 - 8 - 5 - 13 - 9 - 1 - 19','A = 1, B = 2, C = 3… hasta Z = 26','Nehemías','{nehemias}',
+ 'Encuentra el versículo que dice en cuántos días se terminó el muro.','Nehemías',6,15),
+('intermedio','acertijo','«Mientras dormía vi una escalera que llegaba hasta el cielo.»','Piensa en un patriarca del Génesis.','Jacob','{}',
+ 'Encuentra el versículo donde sueña con la escalera y los ángeles.','Génesis',28,12),
+('intermedio','anagrama','BORDEA','Son las mismas letras, en otro orden.','Débora','{debora}',
+ 'Encuentra el versículo que la presenta como profetisa que juzgaba a Israel.','Jueces',4,4),
+('intermedio','desplazado','TBMPNPO','Cada letra está una posición adelante en el alfabeto. Retrocede una.','Salomón','{salomon,rey salomon}',
+ 'Encuentra el versículo donde pide un corazón entendido para juzgar al pueblo.','1 Reyes',3,9),
+('intermedio','acertijo','«Miré hacia atrás y quedé convertida en estatua de sal.»','Piensa en el relato de Sodoma.','La mujer de Lot','{mujer de lot,esposa de lot}',
+ 'Encuentra el versículo donde se convierte en estatua de sal.','Génesis',19,26),
+('intermedio','sin_vocales','P _ B L _','Le faltan las vocales.','Pablo','{saulo,saulo de tarso,pablo de tarso}',
+ 'Encuentra el versículo donde una voz le pregunta: «Saulo, Saulo, ¿por qué me persigues?».','Hechos',9,4),
+('intermedio','sin_vocales','J _ R _ C _','Le faltan las vocales.','Jericó','{jerico}',
+ 'Encuentra el versículo donde el muro se derrumba y el pueblo toma la ciudad.','Josué',6,20),
+('intermedio','numeros','12 - 1 - 26 - 1 - 18 - 15','A = 1, B = 2, C = 3… hasta Z = 26','Lázaro','{lazaro}',
+ 'Encuentra el versículo donde Jesús clama: «¡Lázaro, ven fuera!».','Juan',11,43),
+('intermedio','frase','SAL · VOSOTROS · LA · SOIS · TIERRA · DE · LA','Ordena las palabras para formar la frase.','Vosotros sois la sal de la tierra','{sois la sal de la tierra,la sal de la tierra}',
+ 'Encuentra el versículo exacto donde está escrita esa frase.','Mateo',5,13),
+-- DIFÍCIL
+('dificil','desplazado','OGNSWKUGFGE','Cada letra está dos posiciones adelante en el alfabeto. Retrocede dos.','Melquisedec','{melquisedech}',
+ 'Encuentra el versículo que lo presenta como rey de Salem y sacerdote del Dios Altísimo.','Génesis',14,18),
+('dificil','anagrama','ELOISE','Son las mismas letras, en otro orden.','Eliseo','{profeta eliseo}',
+ 'Encuentra el versículo donde hace flotar el hierro que había caído al agua.','2 Reyes',6,6),
+('dificil','acertijo','«Mi burra habló para salvarme la vida.»','Piensa en el libro de Números.','Balaam','{}',
+ 'Encuentra el versículo donde la asna abre la boca y le habla.','Números',22,28),
+('dificil','sin_vocales','H _ B _ C _ C','Le faltan las vocales.','Habacuc','{}',
+ 'Encuentra el versículo que dice que el justo por su fe vivirá.','Habacuc',2,4),
+('dificil','numeros','5 - 26 - 5 - 17 - 21 - 9 - 5 - 12','A = 1, B = 2, C = 3… hasta Z = 26','Ezequiel','{}',
+ 'Encuentra el versículo donde se le manda profetizar a los huesos secos.','Ezequiel',37,4),
+('dificil','frase','PALABRA · ES · MIS · LÁMPARA · A · TU · PIES','Ordena las palabras para formar la frase.','Lámpara es a mis pies tu palabra','{lampara es a mis pies tu palabra}',
+ 'Encuentra el versículo exacto donde está escrita esa frase.','Salmos',119,105),
+('dificil','acertijo','«Me llamaron el discípulo amado y escribí desde una isla.»','Piensa en el autor del Apocalipsis.','Juan','{juan el apostol,apostol juan}',
+ 'Encuentra el versículo donde dice que estaba en la isla llamada Patmos.','Apocalipsis',1,9),
+('dificil','reverso','LEUMAS','Léelo de derecha a izquierda.','Samuel','{profeta samuel}',
+ 'Encuentra el versículo donde responde: «Habla, porque tu siervo oye».','1 Samuel',3,10),
+('dificil','anagrama','DENEGO','Son las mismas letras, en otro orden.','Gedeón','{gedeon}',
+ 'Encuentra el versículo donde Jehová reduce el ejército a trescientos hombres.','Jueces',7,7),
+('dificil','desplazado','UJNPUFP','Cada letra está una posición adelante en el alfabeto. Retrocede una.','Timoteo','{}',
+ 'Encuentra el versículo donde le dicen que ninguno tenga en poco su juventud.','1 Timoteo',4,12),
+('dificil','sin_vocales','S _ F _ N _ _ S','Le faltan las vocales.','Sofonías','{sofonias}',
+ 'Encuentra el versículo que dice que Jehová está en medio de ti, poderoso, y él salvará.','Sofonías',3,17),
+('dificil','numeros','5 - 19 - 20 - 5 - 2 - 1 - 14','A = 1, B = 2, C = 3… hasta Z = 26','Esteban','{}',
+ 'Encuentra el versículo donde pide: «Señor, no les tomes en cuenta este pecado».','Hechos',7,60);
 end if;
 end $$;

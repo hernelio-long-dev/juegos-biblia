@@ -8,7 +8,8 @@ import { useLiveRefresh } from '../lib/realtime'
 import { emojiPoints } from '../lib/scoring'
 import { errorMessage, playerClient, requestTimeout } from '../lib/supabase'
 import {
-  EMOJI_FINAL_SECONDS, GAME_LABEL, OPTION_STYLES, QUIZ_SECONDS, TABOO_SECONDS, teamStyle,
+  BIBLE_BOOKS, CIPHER_KIND_LABEL, CIPHER_SECONDS, EMOJI_FINAL_SECONDS, GAME_LABEL, OPTION_STYLES,
+  QUIZ_SECONDS, TABOO_SECONDS, VERSE_SECONDS, teamStyle,
   type PlayerState,
 } from '../lib/types'
 
@@ -117,7 +118,9 @@ export default function Play() {
             ? <EmojiPlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
             : round.game === 'taboo'
               ? <TabooPlay key={round.id} state={state} round={round} now={now} />
-              : <QuizPlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
+              : round.game === 'cipher'
+                ? <CipherPlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
+                : <QuizPlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
         ) : (
           <InfoCard emoji="🙌" title={`¡Ya estás dentro, ${me.name.split(' ')[0]}!`} text="Espera a que el administrador inicie el juego. Mantén esta pantalla abierta.">
             <div className="mt-6 flex justify-center gap-2">
@@ -413,6 +416,258 @@ function QuizPlay({ state, round, token, now, refresh }: PlayProps) {
       ) : left === 0 ? (
         <p className="mt-4 text-center font-bold text-rose-200">⏰ Tiempo terminado</p>
       ) : null}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------- CÓDIGO SECRETO BÍBLICO
+function CipherPlay({ state, round, token, now, refresh }: PlayProps) {
+  const my = state.my_answer
+  const solved = my?.is_correct === true
+  const cipher = round.cipher
+  const codeLeft = secondsLeft(round.deadline, now)
+  const verseLeft = secondsLeft(my?.verse_deadline ?? null, now)
+  const revealed = round.status === 'revealed'
+
+  if (revealed) {
+    const codePts = (my?.points ?? 0) - (my?.verse_points ?? 0)
+    return (
+      <div className="card animate-rise p-6 text-center">
+        <RoundHeader round={round} />
+        <p className="text-indigo-200">El código era</p>
+        <p className="mt-1 font-display text-4xl font-bold text-amber-300">{round.answer_text}</p>
+        {round.verse?.reference && (
+          <p className="mt-3 text-lg text-indigo-100">📖 {round.verse.reference}</p>
+        )}
+        <div className={`mt-5 rounded-2xl px-4 py-4 ${solved ? 'bg-emerald-500/20' : 'bg-white/10'}`}>
+          {solved ? (
+            <>
+              <p className="font-display text-2xl font-bold">🎉 ¡+{my?.points} puntos!</p>
+              <p className="mt-1 text-sm text-indigo-200">
+                {codePts} por descifrar
+                {my?.verse_ok ? ` · +${my.verse_points} por encontrar el versículo` : ' · sin bono bíblico'}
+              </p>
+            </>
+          ) : (
+            <p className="font-display text-2xl font-bold">😅 Esta vez no lo descifraste</p>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // 2ª fase: ya descifró, ahora busca el versículo con su propio reloj.
+  if (solved) {
+    if (my?.verse_ok) {
+      return (
+        <div className="card animate-rise p-8 text-center">
+          <RoundHeader round={round} />
+          <div className="animate-pop text-7xl">📖</div>
+          <h2 className="mt-3 font-display text-3xl font-bold">¡Versículo encontrado!</h2>
+          <p className="mt-2 text-2xl font-bold text-amber-300">+{my.verse_points} puntos de bono</p>
+          <p className="mt-1 text-indigo-200">Llevas {my.points} en esta ronda.</p>
+          <p className="mt-6 text-sm text-indigo-300">Espera a que termine la ronda.</p>
+        </div>
+      )
+    }
+    return (
+      <VerseSearch
+        round={round} token={token} refresh={refresh}
+        left={verseLeft ?? 0} tries={my?.verse_tries ?? 0} codePoints={my?.points ?? 0}
+      />
+    )
+  }
+
+  if (codeLeft === 0) {
+    return (
+      <div className="card animate-rise p-8 text-center">
+        <RoundHeader round={round} />
+        <div className="text-7xl">⏰</div>
+        <h2 className="mt-3 font-display text-3xl font-bold">Se acabó el tiempo</h2>
+        <p className="mt-2 text-indigo-200">No alcanzaste a descifrarlo. ¡Vamos por el siguiente código!</p>
+      </div>
+    )
+  }
+
+  return (
+    <CodeSolve round={round} token={token} refresh={refresh} left={codeLeft ?? CIPHER_SECONDS} cipher={cipher} />
+  )
+}
+
+/** 1ª fase: descifrar el código. */
+function CodeSolve({ round, token, refresh, left, cipher }: {
+  round: Round; token: string; refresh: () => Promise<void>; left: number
+  cipher: NonNullable<Round['cipher']> | null
+}) {
+  const [text, setText] = useState('')
+  const [sending, setSending] = useState(false)
+  const [wrong, setWrong] = useState(0)
+  const [error, setError] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  async function submit(e: FormEvent) {
+    e.preventDefault()
+    if (!text.trim() || sending) return
+    setSending(true)
+    setError('')
+    const { data, error } = await playerClient.rpc('submit_cipher', { p_token: token, p_round: round.id, p_text: text })
+    setSending(false)
+    if (error) return setError(errorMessage(error))
+    if (data.ok && data.correct) {
+      celebrate()
+      vibrate([80, 40, 80])
+    } else if (data.ok) {
+      setWrong((w) => w + 1)
+      setText('')
+      vibrate(200)
+      inputRef.current?.focus()
+    } else {
+      const reasons: Record<string, string> = {
+        timeout: 'Se acabó el tiempo.',
+        closed: 'La ronda ya terminó.',
+        max_attempts: 'Llegaste al máximo de intentos.',
+        empty: 'Escribe una respuesta.',
+      }
+      setError(reasons[data.reason] ?? 'No se pudo enviar.')
+    }
+    refresh()
+  }
+
+  return (
+    <div className="card animate-rise p-6">
+      <RoundHeader round={round} extra={<span className="ml-auto"><CountdownRing seconds={left} total={CIPHER_SECONDS} size={56} /></span>} />
+
+      <p className="text-sm uppercase tracking-wider text-indigo-200">
+        🔐 {cipher ? CIPHER_KIND_LABEL[cipher.kind] : 'Código secreto'}
+      </p>
+      <p className="mt-3 break-words text-center font-display text-3xl font-bold leading-snug text-amber-200">
+        {cipher?.puzzle}
+      </p>
+      {cipher?.hint && (
+        <p className="mt-4 rounded-xl bg-white/10 px-3 py-2 text-center text-sm text-indigo-100">
+          💡 {cipher.hint}
+        </p>
+      )}
+
+      <form onSubmit={submit} className="mt-6">
+        <label htmlFor="code" className="label">¿Qué dice el código?</label>
+        <input
+          id="code"
+          ref={inputRef}
+          key={wrong}
+          className={`input py-4 text-xl ${wrong ? 'animate-shake' : ''}`}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="Escribe la respuesta…"
+          maxLength={80}
+          autoComplete="off"
+          autoCapitalize="words"
+          enterKeyHint="send"
+          autoFocus
+        />
+        {wrong > 0 && !error && (
+          <p className="mt-2 text-rose-200">❌ No es correcto, sigue intentando. ({wrong} {wrong === 1 ? 'intento' : 'intentos'})</p>
+        )}
+        <div className="mt-2"><ErrorBox>{error}</ErrorBox></div>
+        <button className="btn-primary mt-4 w-full py-4 text-lg" disabled={!text.trim() || sending}>
+          {sending ? 'Enviando…' : 'Enviar respuesta'}
+        </button>
+      </form>
+    </div>
+  )
+}
+
+/** 2ª fase: confirmar en la Biblia. */
+function VerseSearch({ round, token, refresh, left, tries, codePoints }: {
+  round: Round; token: string; refresh: () => Promise<void>; left: number; tries: number; codePoints: number
+}) {
+  const [book, setBook] = useState('')
+  const [chapter, setChapter] = useState('')
+  const [verse, setVerse] = useState('')
+  const [sending, setSending] = useState(false)
+  const [wrong, setWrong] = useState(0)
+  const [error, setError] = useState('')
+  const timeUp = left === 0
+
+  async function submit(e: FormEvent) {
+    e.preventDefault()
+    if (!book || !chapter || !verse || sending) return
+    setSending(true)
+    setError('')
+    const { data, error } = await playerClient.rpc('submit_verse', {
+      p_token: token, p_round: round.id, p_book: book,
+      p_chapter: Number(chapter), p_verse: Number(verse),
+    })
+    setSending(false)
+    if (error) return setError(errorMessage(error))
+    if (data.ok && data.correct) {
+      celebrate()
+      vibrate([80, 40, 80])
+    } else if (data.ok) {
+      setWrong((w) => w + 1)
+      vibrate(200)
+    } else {
+      const reasons: Record<string, string> = {
+        timeout: 'Se acabó el tiempo para buscar el versículo.',
+        closed: 'La ronda ya terminó.',
+        already: 'Ya respondiste esta parte.',
+        not_solved: 'Primero tienes que descifrar el código.',
+        max_attempts: 'Llegaste al máximo de intentos.',
+        empty: 'Completa el capítulo y el versículo.',
+      }
+      setError(reasons[data.reason] ?? 'No se pudo enviar.')
+    }
+    refresh()
+  }
+
+  return (
+    <div className="card animate-rise p-6">
+      <RoundHeader round={round} extra={<span className="ml-auto"><CountdownRing seconds={left} total={VERSE_SECONDS} size={56} /></span>} />
+
+      <div className="rounded-2xl bg-emerald-500/20 px-4 py-3 text-center">
+        <p className="font-display text-xl font-bold text-emerald-100">✅ ¡Código descifrado! +{codePoints}</p>
+      </div>
+
+      <p className="mt-5 text-sm uppercase tracking-wider text-indigo-200">📖 Ahora búscalo en tu Biblia</p>
+      <p className="mt-2 font-display text-xl font-bold leading-snug">{round.verse?.prompt}</p>
+
+      {timeUp ? (
+        <p className="mt-6 rounded-2xl bg-white/10 px-4 py-4 text-center font-bold text-rose-200">
+          ⏰ Se acabó el tiempo del bono. Conservas tus {codePoints} puntos.
+        </p>
+      ) : (
+        <form onSubmit={submit} className="mt-5">
+          <label className="label" htmlFor="book">Libro</label>
+          <select id="book" className="input py-3 text-lg" value={book} onChange={(e) => setBook(e.target.value)} required>
+            <option value="">Elige el libro…</option>
+            {BIBLE_BOOKS.map((b) => <option key={b} value={b}>{b}</option>)}
+          </select>
+          <div className="mt-3 grid grid-cols-2 gap-3">
+            <div>
+              <label className="label" htmlFor="chapter">Capítulo</label>
+              <input id="chapter" className="input py-3 text-center text-xl" type="number" inputMode="numeric"
+                min={1} max={150} value={chapter} onChange={(e) => setChapter(e.target.value)} required />
+            </div>
+            <div>
+              <label className="label" htmlFor="verse">Versículo</label>
+              <input id="verse" className="input py-3 text-center text-xl" type="number" inputMode="numeric"
+                min={1} max={200} value={verse} onChange={(e) => setVerse(e.target.value)} required />
+            </div>
+          </div>
+          {wrong > 0 && !error && (
+            <p className="mt-3 text-rose-200">
+              ❌ Esa no es la referencia. Te quedan {Math.max(0, 5 - tries)} {5 - tries === 1 ? 'intento' : 'intentos'}.
+            </p>
+          )}
+          <div className="mt-2"><ErrorBox>{error}</ErrorBox></div>
+          <button className="btn-primary mt-4 w-full py-4 text-lg" disabled={!book || !chapter || !verse || sending}>
+            {sending ? 'Enviando…' : 'Confirmar referencia'}
+          </button>
+          <p className="mt-3 text-center text-xs text-indigo-300">
+            Si no la encuentras a tiempo conservas los {codePoints} puntos del código.
+          </p>
+        </form>
+      )}
     </div>
   )
 }

@@ -9,10 +9,10 @@ import { useLiveRefresh } from '../../lib/realtime'
 import { emojiPoints } from '../../lib/scoring'
 import { errorMessage, supabase } from '../../lib/supabase'
 import {
-  DIFFICULTIES, DIFFICULTY_LABEL, EMOJI_FINAL_SECONDS, GAME_ICON, GAME_LABEL, GAMES, OPTION_STYLES,
-  QUIZ_SECONDS, TABOO_SECONDS, teamStyle,
-  type AnswerRow, type Difficulty, type EmojiItem, type Game, type PlayerStatus, type Room, type RoomView,
-  type Round, type ScoreRow, type TabooItem, type Team, type TeamScoreRow,
+  CIPHER_KIND_LABEL, CIPHER_SECONDS, DIFFICULTIES, DIFFICULTY_LABEL, EMOJI_FINAL_SECONDS, GAME_ICON,
+  GAME_LABEL, GAME_SHORT, GAMES, OPTION_STYLES, QUIZ_SECONDS, TABOO_SECONDS, VERSE_SECONDS, teamStyle,
+  type AnswerRow, type CipherItem, type Difficulty, type EmojiItem, type Game, type PlayerStatus,
+  type Room, type RoomView, type Round, type ScoreRow, type TabooItem, type Team, type TeamScoreRow,
 } from '../../lib/types'
 import TeamsDrawer, { suggestedTeams } from './TeamsDrawer'
 
@@ -29,6 +29,7 @@ export default function RoomConsole() {
   const [round, setRound] = useState<Round | null>(null)
   const [emojiItem, setEmojiItem] = useState<EmojiItem | null>(null)
   const [tabooItem, setTabooItem] = useState<TabooItem | null>(null)
+  const [cipherItem, setCipherItem] = useState<CipherItem | null>(null)
   const [answers, setAnswers] = useState<AnswerRow[]>([])
   const [players, setPlayers] = useState<PlayerStatus[]>([])
   const [registered, setRegistered] = useState(0)
@@ -94,16 +95,17 @@ export default function RoomConsole() {
   }, [roomId])
 
   const loadRemaining = useCallback(async () => {
-    const [{ data: e }, { data: q }, { data: tb }, { data: used }] = await Promise.all([
+    const [{ data: e }, { data: q }, { data: tb }, { data: ci }, { data: used }] = await Promise.all([
       supabase.from('emoji_items').select('id, difficulty'),
       supabase.from('quiz_questions').select('id, difficulty'),
       supabase.from('taboo_items').select('id, difficulty'),
+      supabase.from('cipher_items').select('id, difficulty'),
       supabase.from('rounds').select('item_id').eq('room_id', roomId),
     ])
     const usedSet = new Set((used ?? []).map((u) => u.item_id))
     const count = (rows: { id: string; difficulty: Difficulty }[] | null) =>
       Object.fromEntries(DIFFICULTIES.map((d) => [d, (rows ?? []).filter((x) => x.difficulty === d && !usedSet.has(x.id)).length])) as Record<Difficulty, number>
-    setRemaining({ emoji: count(e), quiz: count(q), taboo: count(tb) })
+    setRemaining({ emoji: count(e), quiz: count(q), taboo: count(tb), cipher: count(ci) })
   }, [roomId])
 
   const roundId = round?.id ?? null
@@ -130,6 +132,12 @@ export default function RoomConsole() {
     if (tabooItem?.id === round.item_id) return
     supabase.from('taboo_items').select('*').eq('id', round.item_id).single().then(({ data }) => setTabooItem(data as TabooItem))
   }, [round, tabooItem?.id])
+  // el código actual, para que el admin pueda comprobar la respuesta sin proyectarla
+  useEffect(() => {
+    if (!round || round.game !== 'cipher') return setCipherItem(null)
+    if (cipherItem?.id === round.item_id) return
+    supabase.from('cipher_items').select('*').eq('id', round.item_id).single().then(({ data }) => setCipherItem(data as CipherItem))
+  }, [round, cipherItem?.id])
   useEffect(() => { setPeek(false) }, [round?.id])
 
   useLiveRefresh(roomId, [
@@ -216,13 +224,29 @@ export default function RoomConsole() {
   useEffect(() => {
     if (!round || round.status !== 'active' || autoRevealed.current === round.id) return
     if (now < new Date(round.started_at).getTime()) return
-    const timeOver = round.deadline !== null && now > new Date(round.deadline).getTime() + 1500
     const correctCount = roundAnswers.filter((a) => a.is_correct).length
+
+    // Código secreto: la 2ª fase tiene un reloj por persona, así que la ronda
+    // sigue viva mientras alguien pueda descifrar o buscar su versículo.
+    if (round.game === 'cipher') {
+      const deadlineMs = round.deadline ? new Date(round.deadline).getTime() : 0
+      const stillWorking = players.some((p) => {
+        const mine = roundAnswers.filter((a) => a.participant_id === p.participant_id)
+        const won = mine.find((a) => a.is_correct)
+        if (won) return !won.verse_ok && now < new Date(won.created_at).getTime() + VERSE_SECONDS * 1000
+        return now < deadlineMs
+      })
+      if (stillWorking) return
+    }
+
+    const timeOver = round.game === 'cipher'
+      ? round.deadline !== null && now > new Date(round.deadline).getTime() + (VERSE_SECONDS + 1) * 1000
+      : round.deadline !== null && now > new Date(round.deadline).getTime() + 1500
     // En Tabú solo manda el cronómetro: el admin decide si acertaron.
     const everyone = players.length > 0 && round.game !== 'taboo' && (
       round.game === 'quiz' ? roundAnswers.length >= players.length : correctCount >= players.length
     )
-    if (timeOver || everyone) {
+    if (timeOver || everyone || round.game === 'cipher') {
       autoRevealed.current = round.id
       const id = round.id
       // Sin p_force: el servidor vuelve a comprobar el tiempo y las respuestas antes de revelar.
@@ -233,7 +257,7 @@ export default function RoomConsole() {
         })
       }, everyone && !timeOver ? 1200 : 0)
     }
-  }, [now, round, roundAnswers, players.length, loadRoom])
+  }, [now, round, roundAnswers, players, loadRoom])
 
   const prevStatus = useRef<string | null>(null)
   useEffect(() => {
@@ -312,6 +336,9 @@ export default function RoomConsole() {
         {view === 'round' && round && round.game === 'taboo' && (
           <TabooStage round={round} item={peek ? tabooItem : null} teams={teams} scores={teamScores} answers={roundAnswers} now={now} />
         )}
+        {view === 'round' && round && round.game === 'cipher' && (
+          <CipherStage round={round} item={cipherItem} peek={peek} answers={roundAnswers} players={players} now={now} />
+        )}
         {view === 'leaderboard' && (
           <div className="mx-auto w-full max-w-5xl">
             <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
@@ -368,9 +395,9 @@ export default function RoomConsole() {
                     <button className="btn-secondary" onClick={() => stopTaboo(false)} disabled={busy}>⏹️ No adivinaron</button>
                   </>
                 )}
-                {view === 'round' && round?.game === 'taboo' && round.status !== 'revealed' && (
+                {view === 'round' && round && round.status !== 'revealed' && (round.game === 'taboo' || round.game === 'cipher') && (
                   <button className="btn-ghost px-3 py-2 text-sm" onClick={() => setPeek((p) => !p)}>
-                    {peek ? '🙈 Ocultar palabra' : '👁️ Ver palabra'}
+                    {peek ? '🙈 Ocultar respuesta' : '👁️ Ver respuesta'}
                   </button>
                 )}
                 {view === 'round' && round?.status === 'active' && round.game !== 'taboo' && (
@@ -382,7 +409,7 @@ export default function RoomConsole() {
                   {GAMES.map((g) => (
                     <button key={g} onClick={() => setGame(g)}
                       className={`btn px-3 py-2 text-sm ${game === g ? 'bg-indigo-500 text-white' : 'bg-transparent text-indigo-200 hover:bg-white/10'}`}>
-                      {GAME_ICON[g]} {g === 'emoji' ? 'Emojis' : g === 'quiz' ? 'Selección' : 'Tabú'}
+                      {GAME_ICON[g]} {GAME_SHORT[g]}
                     </button>
                   ))}
                   <span className="mx-1 h-6 w-px bg-white/15" />
@@ -671,6 +698,83 @@ function QuizStage({ round, answers, players, now }: { round: Round; answers: An
         )}
         {revealed && fastest.length === 0 && (
           <p className="text-center font-display text-3xl text-indigo-200">Nadie acertó esta vez 😮</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function CipherStage({ round, item, peek, answers, players, now }: {
+  round: Round; item: CipherItem | null; peek: boolean; answers: AnswerRow[]; players: PlayerStatus[]; now: number
+}) {
+  const revealed = round.status === 'revealed'
+  const codeLeft = secondsLeft(round.deadline, now) ?? 0
+  const solved = answers.filter((a) => a.is_correct)
+  const withVerse = solved.filter((a) => a.verse_ok)
+  // La 2ª fase es individual: sigue abierta mientras alguien tenga su reloj corriendo.
+  const searching = solved.filter(
+    (a) => !a.verse_ok && now < new Date(a.created_at).getTime() + VERSE_SECONDS * 1000,
+  ).length
+
+  return (
+    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col">
+      <StageHeader round={round} right={
+        <div className="flex gap-2">
+          <span className="chip bg-emerald-500/20 px-4 py-2 text-lg text-emerald-100">🔓 {solved.length} de {players.length}</span>
+          <span className="chip bg-sky-500/20 px-4 py-2 text-lg text-sky-100">📖 {withVerse.length}</span>
+        </div>
+      } />
+
+      <div className="flex flex-1 flex-col items-center justify-center gap-8 text-center">
+        {revealed ? (
+          <div className="animate-rise">
+            <p className="text-2xl text-indigo-200">El código era</p>
+            <p className="font-display text-6xl font-bold text-amber-300 sm:text-7xl">{round.answer_text}</p>
+            {item && (
+              <p className="mt-6 font-display text-3xl text-indigo-100">
+                📖 {item.verse_book} {item.verse_chapter}:{item.verse_from}
+                {item.verse_to ? `-${item.verse_to}` : ''}
+              </p>
+            )}
+            <p className="mt-6 text-2xl text-indigo-200">
+              {solved.length} descifraron el código · {withVerse.length} encontraron el versículo
+            </p>
+          </div>
+        ) : (
+          <>
+            <p className="text-xl uppercase tracking-wider text-indigo-300">
+              🔐 {item ? CIPHER_KIND_LABEL[item.kind] : 'Código secreto'}
+            </p>
+            <p className="break-words font-display text-6xl font-bold leading-tight text-amber-200 sm:text-7xl lg:text-8xl">
+              {item?.puzzle}
+            </p>
+            {item?.hint && (
+              <p className="rounded-2xl bg-white/10 px-8 py-4 font-display text-3xl text-indigo-100">💡 {item.hint}</p>
+            )}
+
+            {codeLeft > 0 ? (
+              <div className="flex flex-wrap items-center justify-center gap-8">
+                <CountdownRing seconds={codeLeft} total={CIPHER_SECONDS} size={180} />
+                <p className="font-display text-3xl font-bold text-indigo-100">¡Descifren el código!</p>
+              </div>
+            ) : (
+              <p className="font-display text-4xl font-bold text-indigo-100">
+                {searching > 0
+                  ? `⏰ Se acabó el tiempo del código · ${searching} ${searching === 1 ? 'sigue buscando' : 'siguen buscando'} el versículo`
+                  : '⏰ ¡Tiempo!'}
+              </p>
+            )}
+
+            {peek && item && (
+              <div className="rounded-2xl border border-amber-400/40 bg-amber-400/10 px-5 py-3 text-left">
+                <p className="text-xs font-bold uppercase tracking-wider text-amber-200">Solo para el administrador</p>
+                <p className="font-display text-2xl font-bold text-amber-100">{item.answer}</p>
+                <p className="text-sm text-amber-100/70">
+                  📖 {item.verse_book} {item.verse_chapter}:{item.verse_from}{item.verse_to ? `-${item.verse_to}` : ''}
+                </p>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>

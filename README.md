@@ -1,11 +1,13 @@
 # Competencia Bíblica — PWA
 
-App web instalable (PWA) para competencias bíblicas en vivo con tres juegos:
+App web instalable (PWA) para competencias bíblicas en vivo con cuatro juegos:
 
 1. **Adivina con emojis** — el admin revela pistas (emojis) una por una y los participantes escriben el personaje o historia.
 2. **Selección múltiple** — preguntas con 4 opciones y 20 segundos para responder.
 3. **Tabú bíblico** — por equipos: el sistema elige a un integrante, le muestra una palabra secreta con
    palabras prohibidas, y su equipo tiene 45 segundos para adivinarla mientras él la describe.
+4. **Código secreto bíblico** — individual y en dos fases: descifrar un código (números por letras,
+   palabras al revés, anagramas, acertijos…) y después confirmarlo buscando el versículo en la Biblia.
 
 **Stack:** Vite + React + TypeScript · Tailwind CSS v4 · vite-plugin-pwa · Supabase (Postgres, Auth, Realtime y funciones RPC).
 
@@ -15,8 +17,8 @@ App web instalable (PWA) para competencias bíblicas en vivo con tres juegos:
 
 1. Abre tu proyecto en Supabase → **SQL Editor** → **New query**.
 2. Copia y pega todo el contenido de [`supabase/schema.sql`](supabase/schema.sql) y presiona **Run**.
-   Crea las tablas, la seguridad, la lógica del juego y un banco inicial de **36 emojis**, **45 preguntas**
-   y **36 palabras de Tabú** (12 de cada nivel: fácil, intermedio, difícil).
+   Crea las tablas, la seguridad, la lógica del juego y un banco inicial de **36 emojis**, **45 preguntas**,
+   **36 palabras de Tabú** y **36 códigos secretos** (12 de cada nivel: fácil, intermedio, difícil).
 3. Crea la cuenta del administrador: **Authentication → Users → Add user → Create new user**
    (correo + contraseña, marca **Auto Confirm User**).
 4. Entra a la app en `/admin` con ese correo. **La primera cuenta que inicia sesión queda como administradora**; las demás no tendrán acceso.
@@ -64,7 +66,7 @@ npm run deploy         # compila y sube a https://competencia-biblica.<tu-subdom
 - **Equipos** (botón 🤝, solo para Tabú): eliges cuántos equipos quieres (de 2 a 6; el sistema sugiere uno
   según cuánta gente hay) y el reparto es automático y al azar, en grupos del mismo tamaño (±1).
   Puedes renombrar un equipo, mover a alguien de equipo o volver a repartir.
-- **Bancos de emojis / preguntas / Tabú:** agrega, edita o elimina contenido.
+- **Bancos de emojis / preguntas / Tabú / códigos:** agrega, edita o elimina contenido.
 
 Atajos en la consola: `Espacio` siguiente pista/ronda (o iniciar los 45 s en Tabú) · `Enter` ¡adivinaron! (Tabú) ·
 `R` revelar · `T` tabla · `H` ocultar controles · `F` pantalla completa.
@@ -105,6 +107,30 @@ Si alguien cambia de celular, el admin puede **liberar** su nombre desde 👥 (c
 - 3 s de “¡Prepárate!” y luego **20 segundos**; después ya no se acepta respuesta.
 - Correcta: **50** (fácil) · **75** (intermedio) · **100** (difícil) **+ 1 punto por cada segundo que sobre** (máx. +20).
 - Incorrecta o sin respuesta: 0.
+
+### Código secreto bíblico
+Dos fases en la misma ronda, ambas con puntaje por rapidez y × el nivel (×1, ×1.5, ×2):
+
+- **Descifrar el código** — 60 s para todos: **20 + 1 punto por cada segundo que sobre**.
+- **Bono bíblico** — otros 60 s con **reloj propio**, que arranca en el momento en que esa persona
+  descifró (no cuando empezó la ronda): **10 + 0.5 puntos por cada segundo que sobre**.
+
+| | Fácil ×1 | Intermedio ×1.5 | Difícil ×2 |
+|---|---|---|---|
+| Descifra al instante | 80 | 120 | 160 |
+| Descifra en 30 s | 50 | 75 | 100 |
+| Bono al instante | +40 | +60 | +80 |
+| Bono en 30 s | +25 | +38 | +50 |
+| **Máximo por ronda** | **120** | **180** | **240** |
+
+- Si no encuentra la referencia a tiempo, **conserva** los puntos del código; solo pierde el bono.
+- Hasta 12 intentos para el código y 5 para la referencia (evita adivinar a lo bruto).
+- La consigna del versículo delata la respuesta, así que **solo llega al celular de quien ya descifró**.
+  La pantalla grande muestra el código, el tiempo y cuántos van, nunca la respuesta hasta revelar.
+- La referencia se envía eligiendo el libro de una lista de los 66 más capítulo y versículo, así que
+  no hay problemas de ortografía. Si el ítem define un rango, se acepta cualquier versículo dentro de él.
+- Como cada quien tiene su propio reloj en la 2ª fase, la ronda se cierra sola cuando ya nadie
+  puede seguir jugando (o cuando el admin pulsa «Revelar respuesta»).
 
 ### Tabú bíblico
 - **45 segundos** por palabra. Acertar vale **30 + 1.5 puntos por cada segundo que sobre**, multiplicado por el nivel

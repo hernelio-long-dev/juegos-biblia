@@ -7,6 +7,7 @@ import EmojiBankTab from './EmojiBankTab'
 import QuizBankTab from './QuizBankTab'
 import TabooBankTab from './TabooBankTab'
 import HistoryTab from './HistoryTab'
+import CipherBankTab from './CipherBankTab'
 
 const TABS = [
   { id: 'salas', label: 'Salas', icon: '🏠' },
@@ -15,6 +16,7 @@ const TABS = [
   { id: 'emojis', label: 'Banco de emojis', icon: '😀' },
   { id: 'preguntas', label: 'Banco de preguntas', icon: '❓' },
   { id: 'taboo', label: 'Banco de Tabú', icon: '🤫' },
+  { id: 'codigo', label: 'Banco de códigos', icon: '🔐' },
 ] as const
 
 export default function AdminDashboard() {
@@ -48,6 +50,7 @@ export default function AdminDashboard() {
         {tab === 'emojis' && <EmojiBankTab />}
         {tab === 'preguntas' && <QuizBankTab />}
         {tab === 'taboo' && <TabooBankTab />}
+        {tab === 'codigo' && <CipherBankTab />}
       </div>
     </div>
   )

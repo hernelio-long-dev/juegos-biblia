@@ -1,5 +1,6 @@
 export type Difficulty = 'facil' | 'intermedio' | 'dificil'
-export type Game = 'emoji' | 'quiz' | 'taboo'
+export type Game = 'emoji' | 'quiz' | 'taboo' | 'cipher'
+export type CipherKind = 'numeros' | 'reverso' | 'anagrama' | 'desplazado' | 'sin_vocales' | 'acertijo' | 'frase'
 export type RoomView = 'lobby' | 'round' | 'leaderboard' | 'podium'
 export type RoundStatus = 'pending' | 'active' | 'revealed'
 
@@ -17,19 +18,38 @@ export const DIFFICULTY_STYLE: Record<Difficulty, string> = {
   dificil: 'bg-rose-400/20 text-rose-200',
 }
 
-export const GAMES: Game[] = ['emoji', 'quiz', 'taboo']
+export const GAMES: Game[] = ['emoji', 'quiz', 'taboo', 'cipher']
 
 export const GAME_LABEL: Record<Game, string> = {
   emoji: 'Adivina con emojis',
   quiz: 'Selección múltiple',
   taboo: 'Tabú bíblico',
+  cipher: 'Código secreto bíblico',
 }
 
-export const GAME_ICON: Record<Game, string> = { emoji: '😀', quiz: '❓', taboo: '🤫' }
+export const GAME_SHORT: Record<Game, string> = {
+  emoji: 'Emojis', quiz: 'Selección', taboo: 'Tabú', cipher: 'Código',
+}
+
+export const GAME_ICON: Record<Game, string> = { emoji: '😀', quiz: '❓', taboo: '🤫', cipher: '🔐' }
+
+export const CIPHER_KINDS: CipherKind[] = ['numeros', 'reverso', 'anagrama', 'desplazado', 'sin_vocales', 'acertijo', 'frase']
+
+export const CIPHER_KIND_LABEL: Record<CipherKind, string> = {
+  numeros: 'Números por letras',
+  reverso: 'Al revés',
+  anagrama: 'Letras mezcladas',
+  desplazado: 'Letras desplazadas',
+  sin_vocales: 'Sin vocales',
+  acertijo: 'Acertijo',
+  frase: 'Frase desordenada',
+}
 
 export const QUIZ_SECONDS = 20
 export const EMOJI_FINAL_SECONDS = 30
 export const TABOO_SECONDS = 45
+export const CIPHER_SECONDS = 60
+export const VERSE_SECONDS = 60
 
 // Deben coincidir con emoji_points / quiz_points / taboo_points en supabase/schema.sql
 export const EMOJI_TIERS = [100, 70, 50, 30]
@@ -37,6 +57,23 @@ export const DIFFICULTY_MULTIPLIER: Record<Difficulty, number> = { facil: 1, int
 export const QUIZ_BASE: Record<Difficulty, number> = { facil: 50, intermedio: 75, dificil: 100 }
 export const TABOO_BASE = 30
 export const TABOO_PER_SECOND = 1.5
+export const CIPHER_BASE = 20
+export const CIPHER_PER_SECOND = 1
+export const VERSE_BASE = 10
+export const VERSE_PER_SECOND = 0.5
+
+/** Los 66 libros, en el orden y con la ortografía de Reina-Valera. */
+export const BIBLE_BOOKS = [
+  'Génesis', 'Éxodo', 'Levítico', 'Números', 'Deuteronomio', 'Josué', 'Jueces', 'Rut',
+  '1 Samuel', '2 Samuel', '1 Reyes', '2 Reyes', '1 Crónicas', '2 Crónicas', 'Esdras', 'Nehemías',
+  'Ester', 'Job', 'Salmos', 'Proverbios', 'Eclesiastés', 'Cantares', 'Isaías', 'Jeremías',
+  'Lamentaciones', 'Ezequiel', 'Daniel', 'Oseas', 'Joel', 'Amós', 'Abdías', 'Jonás', 'Miqueas',
+  'Nahúm', 'Habacuc', 'Sofonías', 'Hageo', 'Zacarías', 'Malaquías',
+  'Mateo', 'Marcos', 'Lucas', 'Juan', 'Hechos', 'Romanos', '1 Corintios', '2 Corintios',
+  'Gálatas', 'Efesios', 'Filipenses', 'Colosenses', '1 Tesalonicenses', '2 Tesalonicenses',
+  '1 Timoteo', '2 Timoteo', 'Tito', 'Filemón', 'Hebreos', 'Santiago', '1 Pedro', '2 Pedro',
+  '1 Juan', '2 Juan', '3 Juan', 'Judas', 'Apocalipsis',
+] as const
 
 /** Colores de los equipos de Tabú, por número de equipo. */
 export const TEAM_STYLES = [
@@ -87,6 +124,21 @@ export interface PlayerStatus {
   name: string
   joined_at: string
   last_seen: string | null
+}
+
+export interface CipherItem {
+  id: string
+  difficulty: Difficulty
+  kind: CipherKind
+  puzzle: string
+  hint: string | null
+  answer: string
+  aliases: string[]
+  verse_prompt: string
+  verse_book: string
+  verse_chapter: number
+  verse_from: number
+  verse_to: number | null
 }
 
 export interface TabooItem {
@@ -171,6 +223,10 @@ export interface AnswerRow {
   points: number
   clue_number: number | null
   elapsed_ms: number | null
+  verse_text: string | null
+  verse_ok: boolean | null
+  verse_points: number
+  verse_tries: number
   created_at: string
 }
 
@@ -192,6 +248,9 @@ export interface PlayerState {
     i_describe: boolean
     /** Solo llega al celular de quien describe, o a todos cuando se revela. */
     secret: { word: string; forbidden: string[]; reference: string | null } | null
+    /** Código secreto: el enigma es público; la consigna del versículo no. */
+    cipher: { kind: CipherKind; puzzle: string; hint: string | null } | null
+    verse: { prompt: string; reference: string | null } | null
   }) | null
   my_answer: {
     choice: number | null
@@ -199,6 +258,11 @@ export interface PlayerState {
     is_correct: boolean | null
     points: number | null
     clue_number: number | null
+    verse_ok: boolean | null
+    verse_points: number
+    verse_tries: number
+    /** Reloj personal de la 2ª fase: arranca cuando esta persona descifró. */
+    verse_deadline: string | null
     attempts: number
   } | null
 }

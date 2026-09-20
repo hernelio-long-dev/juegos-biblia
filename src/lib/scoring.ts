@@ -1,5 +1,6 @@
 import {
-  DIFFICULTY_MULTIPLIER, EMOJI_TIERS, QUIZ_BASE, TABOO_BASE, TABOO_PER_SECOND, TABOO_SECONDS,
+  CIPHER_BASE, CIPHER_PER_SECOND, CIPHER_SECONDS, DIFFICULTY_MULTIPLIER, EMOJI_TIERS, QUIZ_BASE,
+  TABOO_BASE, TABOO_PER_SECOND, TABOO_SECONDS, VERSE_BASE, VERSE_PER_SECOND, VERSE_SECONDS,
   type Difficulty,
 } from './types'
 
@@ -20,4 +21,21 @@ export function tabooPoints(difficulty: Difficulty, elapsedMs: number): number {
 
 export function tabooMaxPoints(difficulty: Difficulty): number {
   return tabooPoints(difficulty, 0)
+}
+
+/** Debe coincidir con cipher_points en supabase/schema.sql. */
+export function cipherPoints(difficulty: Difficulty, elapsedMs: number): number {
+  const spare = Math.max(0, Math.min(CIPHER_SECONDS, CIPHER_SECONDS - elapsedMs / 1000))
+  return Math.round((CIPHER_BASE + CIPHER_PER_SECOND * spare) * DIFFICULTY_MULTIPLIER[difficulty])
+}
+
+/** Debe coincidir con verse_points en supabase/schema.sql. */
+export function versePoints(difficulty: Difficulty, elapsedMs: number): number {
+  const spare = Math.max(0, Math.min(VERSE_SECONDS, VERSE_SECONDS - elapsedMs / 1000))
+  return Math.round((VERSE_BASE + VERSE_PER_SECOND * spare) * DIFFICULTY_MULTIPLIER[difficulty])
+}
+
+/** Máximo posible de una ronda completa: descifrar al instante + versículo al instante. */
+export function cipherMaxPoints(difficulty: Difficulty): number {
+  return cipherPoints(difficulty, 0) + versePoints(difficulty, 0)
 }
