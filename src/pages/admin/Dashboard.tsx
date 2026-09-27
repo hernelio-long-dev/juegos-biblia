@@ -8,6 +8,7 @@ import QuizBankTab from './QuizBankTab'
 import TabooBankTab from './TabooBankTab'
 import HistoryTab from './HistoryTab'
 import CipherBankTab from './CipherBankTab'
+import AuctionBankTab from './AuctionBankTab'
 
 const TABS = [
   { id: 'salas', label: 'Salas', icon: '🏠' },
@@ -17,6 +18,7 @@ const TABS = [
   { id: 'preguntas', label: 'Banco de preguntas', icon: '❓' },
   { id: 'taboo', label: 'Banco de Tabú', icon: '🤫' },
   { id: 'codigo', label: 'Banco de códigos', icon: '🔐' },
+  { id: 'subasta', label: 'Banco de subasta', icon: '🔨' },
 ] as const
 
 export default function AdminDashboard() {
@@ -51,6 +53,7 @@ export default function AdminDashboard() {
         {tab === 'preguntas' && <QuizBankTab />}
         {tab === 'taboo' && <TabooBankTab />}
         {tab === 'codigo' && <CipherBankTab />}
+        {tab === 'subasta' && <AuctionBankTab />}
       </div>
     </div>
   )

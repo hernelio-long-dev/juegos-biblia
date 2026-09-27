@@ -70,6 +70,18 @@ create table if not exists public.taboo_items (
   created_at timestamptz not null default now()
 );
 
+-- Subasta Bíblica: la pregunta llega después de apostar; solo se anuncian categoría y nivel.
+create table if not exists public.auction_questions (
+  id         uuid primary key default gen_random_uuid(),
+  category   text not null check (char_length(trim(category)) between 1 and 60),
+  difficulty text not null check (difficulty in ('facil','intermedio','dificil')),
+  question   text not null,
+  answer     text not null,
+  aliases    text[] not null default '{}',
+  reference  text,
+  created_at timestamptz not null default now()
+);
+
 create table if not exists public.rooms (
   id               uuid primary key default gen_random_uuid(),
   name             text not null,
@@ -125,10 +137,38 @@ create unique index if not exists team_members_one_per_room on public.team_membe
 alter table public.teams        replica identity full;
 alter table public.team_members replica identity full;
 
+-- Subasta Bíblica: una partida por sala a la vez, con los equipos de la sala.
+create table if not exists public.auctions (
+  id              uuid primary key default gen_random_uuid(),
+  room_id         uuid not null references public.rooms(id) on delete cascade,
+  status          text not null default 'running' check (status in ('running','finished')),
+  rounds_total    int  not null check (rounds_total between 1 and 30),
+  initial_balance int  not null,
+  created_at      timestamptz not null default now(),
+  finished_at     timestamptz
+);
+create unique index if not exists auctions_one_running on public.auctions(room_id) where status = 'running';
+
+-- Saldo de cada equipo. Nombre y número se copian para que el resultado sobreviva
+-- a que después se rehagan los equipos de la sala.
+create table if not exists public.auction_teams (
+  id            uuid primary key default gen_random_uuid(),
+  auction_id    uuid not null references public.auctions(id) on delete cascade,
+  team_id       uuid references public.teams(id) on delete set null,
+  name          text not null,
+  seq           int  not null,
+  balance       int  not null,
+  -- el celular que apuesta y responde por el equipo
+  controller_id uuid references public.participants(id) on delete set null,
+  unique (auction_id, seq)
+);
+alter table public.auctions      replica identity full;
+alter table public.auction_teams replica identity full;
+
 create table if not exists public.rounds (
   id             uuid primary key default gen_random_uuid(),
   room_id        uuid not null references public.rooms(id) on delete cascade,
-  game           text not null check (game in ('emoji','quiz','taboo','cipher')),
+  game           text not null check (game in ('emoji','quiz','taboo','cipher','auction')),
   difficulty     text not null check (difficulty in ('facil','intermedio','dificil')),
   item_id        uuid not null,
   seq            int  not null,
@@ -139,6 +179,8 @@ create table if not exists public.rounds (
   options        text[],
   team_id        uuid,   -- Tabú: equipo al que le toca el turno
   describer_id   uuid,   -- Tabú: integrante que describe la palabra
+  auction_id     uuid references public.auctions(id) on delete set null, -- Subasta
+  category       text,   -- Subasta: lo único que se anuncia antes de apostar
   started_at     timestamptz not null default now(),
   deadline       timestamptz,
   answer_text    text,   -- se llena solo al revelar
@@ -160,8 +202,10 @@ do $$ begin
   alter table public.rooms  add column if not exists counts_for_history boolean not null default true;
   alter table public.rounds add column if not exists team_id uuid;
   alter table public.rounds add column if not exists describer_id uuid;
+  alter table public.rounds add column if not exists auction_id uuid references public.auctions(id) on delete set null;
+  alter table public.rounds add column if not exists category text;
   alter table public.rounds drop constraint if exists rounds_game_check;
-  alter table public.rounds add  constraint rounds_game_check   check (game in ('emoji','quiz','taboo','cipher'));
+  alter table public.rounds add  constraint rounds_game_check   check (game in ('emoji','quiz','taboo','cipher','auction'));
   alter table public.rounds drop constraint if exists rounds_status_check;
   alter table public.rounds add  constraint rounds_status_check check (status in ('pending','active','revealed'));
   if not exists (select 1 from pg_constraint where conname = 'rounds_team_fk') then
@@ -204,6 +248,22 @@ do $$ begin
   alter table public.answers add column if not exists verse_points int not null default 0;
   alter table public.answers add column if not exists verse_tries  int not null default 0;
 end $$;
+
+-- Subasta: una fila por equipo y ronda. Solo la lee el admin; los celulares
+-- la reciben filtrada por player_state, así nadie ve apuestas ajenas antes de tiempo.
+create table if not exists public.auction_bids (
+  round_id        uuid not null references public.rounds(id) on delete cascade,
+  auction_team_id uuid not null references public.auction_teams(id) on delete cascade,
+  amount          int  not null check (amount > 0),
+  auto            boolean not null default false,  -- no apostaron a tiempo: se puso la mínima
+  bid_at          timestamptz not null default now(),
+  answer_text     text,
+  is_correct      boolean,
+  answered_at     timestamptz,
+  delta           int,     -- se llena al revelar: lo que ganó o perdió
+  balance_after   int,
+  primary key (round_id, auction_team_id)
+);
 
 -- ---------------------------------------------------------------------
 -- UTILIDADES
@@ -320,6 +380,17 @@ language sql immutable as $$
   )::int
 $$;
 
+-- Subasta: saldo inicial 300; se apuesta de 20 a 150 por ronda (o todo el saldo si es menor).
+-- Acertar paga lo apostado × nivel (fácil 1, intermedio 1.5, difícil 2); fallar lo resta.
+-- Un equipo con menos de 20 igual puede apostar 20: si falla, su saldo queda en 0, nunca negativo.
+create or replace function public.auction_gain(p_difficulty text, p_amount int) returns int
+language sql immutable as $$
+  select round(p_amount * (case p_difficulty when 'dificil' then 2.0 when 'intermedio' then 1.5 else 1.0 end))::int
+$$;
+
+create or replace function public.auction_max_bid(p_balance int) returns int
+language sql immutable as $$ select greatest(20, least(150, p_balance)) $$;
+
 -- ---------------------------------------------------------------------
 -- FUNCIONES DEL ADMINISTRADOR
 -- ---------------------------------------------------------------------
@@ -382,6 +453,17 @@ begin
       ) then
         return false;
       end if;
+    elsif rd.game = 'auction' then
+      -- Se cierra al vencer el tiempo o cuando todos los equipos respondieron.
+      if clock_timestamp() < rd.deadline and exists (
+        select 1 from auction_teams at
+         where at.auction_id = rd.auction_id
+           and not exists (select 1 from auction_bids b
+                            where b.round_id = rd.id and b.auction_team_id = at.id
+                              and b.answered_at is not null)
+      ) then
+        return false;
+      end if;
     else
       select count(*) into v_players from room_players where room_id = rd.room_id;
       select count(distinct participant_id), count(*) filter (where is_correct)
@@ -405,12 +487,37 @@ begin
       when 'emoji'  then (select e.answer from emoji_items e where e.id = r.item_id)
       when 'taboo'  then (select ti.word from taboo_items ti where ti.id = r.item_id)
       when 'cipher' then (select ci.answer from cipher_items ci where ci.id = r.item_id)
+      when 'auction' then (select aq.answer from auction_questions aq where aq.id = r.item_id)
       else (select q.options[q.correct_index + 1] from quiz_questions q where q.id = r.item_id) end,
     correct_index = case when r.game = 'quiz'
       then (select q.correct_index from quiz_questions q where q.id = r.item_id) end,
     clues_revealed = coalesce(r.clues_total, r.clues_revealed)
   where r.id = p_round and r.status <> 'revealed';
+
+  -- Subasta: se liquida una sola vez (el update de arriba solo afecta una fila la primera vez).
+  -- Si se cerró mientras apostaban, la pregunta nunca se mostró y la ronda queda anulada.
+  if found and rd.game = 'auction' and rd.status = 'active' then
+    perform settle_auction_round(p_round);
+  end if;
   return true;
+end $$;
+
+-- Aplica el resultado de la ronda al saldo de cada equipo.
+create or replace function public.settle_auction_round(p_round uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare rd rounds; b auction_bids; v_bal int; v_delta int;
+begin
+  select * into rd from rounds where id = p_round and game = 'auction';
+  if not found then return; end if;
+  for b in select * from auction_bids where round_id = p_round and delta is null loop
+    select balance into v_bal from auction_teams where id = b.auction_team_id for update;
+    v_delta := case when coalesce(b.is_correct, false)
+                    then auction_gain(rd.difficulty, b.amount)
+                    else -least(b.amount, v_bal) end;
+    update auction_teams set balance = v_bal + v_delta where id = b.auction_team_id;
+    update auction_bids set delta = v_delta, balance_after = v_bal + v_delta
+     where round_id = b.round_id and auction_team_id = b.auction_team_id;
+  end loop;
 end $$;
 
 create or replace function public.start_round(p_room uuid, p_game text, p_difficulty text) returns uuid
@@ -420,6 +527,9 @@ begin
   if not is_admin() then raise exception 'No autorizado'; end if;
   if not exists (select 1 from rooms where id = p_room and status = 'open') then
     raise exception 'La sala no está abierta';
+  end if;
+  if exists (select 1 from auctions where room_id = p_room and status = 'running') then
+    raise exception 'Hay una Subasta Bíblica en curso. Termínala antes de cambiar de juego.';
   end if;
   for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
     perform reveal_round(v_old, true);
@@ -487,9 +597,12 @@ begin
   if exists (select 1 from rounds where room_id = p_room and game = 'taboo' and status <> 'revealed') then
     raise exception 'Termina la ronda de Tabú en curso antes de rehacer los equipos';
   end if;
+  if exists (select 1 from auctions where room_id = p_room and status = 'running') then
+    raise exception 'Termina la Subasta Bíblica antes de rehacer los equipos';
+  end if;
   select count(*) into v_count from room_players where room_id = p_room;
   if v_count < 2 then raise exception 'Se necesitan al menos 2 participantes dentro de la sala'; end if;
-  v_n := greatest(2, least(coalesce(p_teams, 2), 6, v_count));
+  v_n := greatest(2, least(coalesce(p_teams, 2), 12, v_count));
 
   delete from teams where room_id = p_room;  -- en cascada borra team_members
   for i in 1..v_n loop
@@ -513,6 +626,11 @@ create or replace function public.set_team(p_room uuid, p_participant uuid, p_te
 language plpgsql security definer set search_path = public as $$
 begin
   if not is_admin() then raise exception 'No autorizado'; end if;
+  -- Durante la subasta el resultado es del equipo completo: solo se puede sumar a quien llegó tarde.
+  if exists (select 1 from auctions where room_id = p_room and status = 'running')
+     and exists (select 1 from team_members where room_id = p_room and participant_id = p_participant) then
+    raise exception 'Durante la Subasta Bíblica no se puede cambiar a nadie de equipo';
+  end if;
   delete from team_members where room_id = p_room and participant_id = p_participant;
   if p_team is not null then
     if not exists (select 1 from teams where id = p_team and room_id = p_room) then
@@ -527,6 +645,9 @@ language plpgsql security definer set search_path = public as $$
 begin
   if not is_admin() then raise exception 'No autorizado'; end if;
   update teams set name = coalesce(nullif(trim(p_name), ''), name) where id = p_team;
+  update auction_teams at set name = t.name
+    from teams t, auctions au
+   where t.id = p_team and at.team_id = t.id and au.id = at.auction_id and au.status = 'running';
 end $$;
 
 create or replace function public.room_teams(p_room uuid) returns json
@@ -553,6 +674,9 @@ begin
   end if;
   if not exists (select 1 from teams where id = p_team and room_id = p_room) then
     raise exception 'Equipo no válido para esta sala';
+  end if;
+  if exists (select 1 from auctions where room_id = p_room and status = 'running') then
+    raise exception 'Hay una Subasta Bíblica en curso. Termínala antes de cambiar de juego.';
   end if;
   for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
     perform reveal_round(v_old, true);
@@ -619,6 +743,165 @@ begin
   return json_build_object('ok', true, 'points', v_pts, 'members', v_n, 'elapsed_ms', v_elapsed);
 end $$;
 
+-- SUBASTA BÍBLICA -------------------------------------------------------
+-- Elige el celular que apuesta por el equipo: alguien conectado, al azar.
+create or replace function public.pick_auction_controller(p_room uuid, p_team uuid) returns uuid
+language sql volatile security definer set search_path = public as $$
+  select m.participant_id
+    from team_members m
+    left join lateral (select max(pt.last_seen) as seen from player_tokens pt
+                        where pt.room_id = p_room and pt.participant_id = m.participant_id) x on true
+   where m.team_id = p_team
+   order by (x.seen > clock_timestamp() - interval '30 seconds') desc nulls last, random()
+   limit 1;
+$$;
+
+-- Forma equipos de 3 o 4 con los que están en la sala (o usa los que ya hay),
+-- da a todos el mismo saldo y elige el celular controlador de cada equipo.
+create or replace function public.start_auction(p_room uuid, p_rounds int default 8, p_reshuffle boolean default true)
+returns uuid
+language plpgsql security definer set search_path = public as $$
+declare v_id uuid; v_old uuid; v_count int; v_teams int; tm teams;
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  if not exists (select 1 from rooms where id = p_room and status = 'open') then
+    raise exception 'La sala no está abierta';
+  end if;
+  if exists (select 1 from auctions where room_id = p_room and status = 'running') then
+    raise exception 'Ya hay una Subasta Bíblica en curso en esta sala';
+  end if;
+  for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
+    perform reveal_round(v_old, true);
+  end loop;
+
+  if p_reshuffle or not exists (select 1 from teams where room_id = p_room) then
+    select count(*) into v_count from room_players where room_id = p_room;
+    -- Equipos de 3 o 4: 10 personas → 4 + 3 + 3.
+    v_teams := greatest(2, ceil(v_count / 4.0)::int);
+    perform assign_teams(p_room, v_teams);
+  end if;
+  if (select count(distinct m.team_id) from team_members m where m.room_id = p_room) < 2 then
+    raise exception 'Se necesitan al menos 2 equipos con integrantes';
+  end if;
+
+  insert into auctions(room_id, rounds_total, initial_balance)
+  values (p_room, greatest(1, least(30, coalesce(p_rounds, 8))), 300)
+  returning id into v_id;
+
+  for tm in select t.* from teams t
+             where t.room_id = p_room
+               and exists (select 1 from team_members m where m.team_id = t.id)
+             order by t.seq loop
+    insert into auction_teams(auction_id, team_id, name, seq, balance, controller_id)
+    values (v_id, tm.id, tm.name, tm.seq, 300, pick_auction_controller(p_room, tm.id));
+  end loop;
+
+  update rooms set current_round_id = null, view = 'round' where id = p_room;
+  return v_id;
+end $$;
+
+-- Nueva ronda: se anuncia solo la categoría y el nivel. La pregunta queda
+-- guardada aparte y no se copia a rounds.prompt hasta cerrar las apuestas.
+-- p_difficulty null = nivel al azar.
+create or replace function public.start_auction_round(p_room uuid, p_difficulty text default null) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare au auctions; v_seq int; v_id uuid; v_old uuid; v_played int; v_last text; q auction_questions;
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  select * into au from auctions where room_id = p_room and status = 'running';
+  if not found then raise exception 'Primero inicia la Subasta Bíblica'; end if;
+  select count(*) into v_played from rounds where auction_id = au.id and prompt is not null;
+  if v_played >= au.rounds_total then
+    raise exception 'Ya se jugaron las % rondas. Pulsa «Terminar subasta».', au.rounds_total;
+  end if;
+  for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
+    perform reveal_round(v_old, true);
+  end loop;
+
+  select category into v_last from rounds where auction_id = au.id order by seq desc limit 1;
+  -- Categoría distinta a la anterior y, si se puede, una que aún no haya salido.
+  select * into q from auction_questions it
+   where (p_difficulty is null or it.difficulty = p_difficulty)
+     and not exists (select 1 from rounds r where r.room_id = p_room and r.item_id = it.id)
+   order by (it.category = v_last) nulls first,
+            (select count(*) from rounds r where r.auction_id = au.id and r.category = it.category),
+            random()
+   limit 1;
+  if not found then
+    raise exception 'Ya no quedan preguntas de subasta%', coalesce(' de nivel ' || p_difficulty, '');
+  end if;
+
+  select coalesce(max(seq), 0) + 1 into v_seq from rounds where room_id = p_room;
+  insert into rounds(room_id, game, difficulty, item_id, seq, status, auction_id, category, started_at, deadline)
+  values (p_room, 'auction', q.difficulty, q.id, v_seq, 'pending', au.id, q.category,
+          clock_timestamp(), clock_timestamp() + interval '30 seconds')
+  returning id into v_id;
+
+  update rooms set current_round_id = v_id, view = 'round' where id = p_room;
+  return v_id;
+end $$;
+
+-- Cierra las apuestas y muestra la pregunta a todos a la vez.
+-- Quien no apostó a tiempo queda con la apuesta mínima.
+-- p_force = false → solo si ya se venció el tiempo o todos apostaron.
+create or replace function public.close_auction_bids(p_round uuid, p_force boolean default false) returns boolean
+language plpgsql security definer set search_path = public as $$
+declare rd rounds; v_question text;
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  select * into rd from rounds where id = p_round and game = 'auction' for update;
+  if not found then raise exception 'Ronda no válida'; end if;
+  if rd.status <> 'pending' then return rd.status = 'active'; end if;
+  if not p_force and clock_timestamp() < rd.deadline and exists (
+    select 1 from auction_teams at
+     where at.auction_id = rd.auction_id
+       and not exists (select 1 from auction_bids b where b.round_id = rd.id and b.auction_team_id = at.id)
+  ) then
+    return false;
+  end if;
+
+  insert into auction_bids(round_id, auction_team_id, amount, auto)
+  select rd.id, at.id, 20, true from auction_teams at where at.auction_id = rd.auction_id
+  on conflict do nothing;
+
+  select question into v_question from auction_questions where id = rd.item_id;
+  update rounds set status = 'active', prompt = v_question,
+                    started_at = clock_timestamp(), deadline = clock_timestamp() + interval '40 seconds'
+   where id = rd.id;
+  return true;
+end $$;
+
+-- Termina la subasta: el saldo ganado (lo que quedó por encima del inicial) se
+-- asigna igual a cada integrante del equipo y entra al ranking de la sala y al histórico.
+create or replace function public.finish_auction(p_room uuid) returns json
+language plpgsql security definer set search_path = public as $$
+declare au auctions; v_old uuid; v_last uuid; v_n int := 0;
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  select * into au from auctions where room_id = p_room and status = 'running' for update;
+  if not found then return json_build_object('ok', false, 'reason', 'not_running'); end if;
+  for v_old in select id from rounds where auction_id = au.id and status <> 'revealed' loop
+    perform reveal_round(v_old, true);
+  end loop;
+
+  -- Los puntos se cuelgan de la última ronda jugada, así cuentan en room_scoreboard y global_scoreboard.
+  select id into v_last from rounds where auction_id = au.id and prompt is not null order by seq desc limit 1;
+  if v_last is not null then
+    insert into answers(round_id, room_id, participant_id, is_correct, points)
+    select v_last, p_room, m.participant_id,
+           at.balance > au.initial_balance, greatest(0, at.balance - au.initial_balance)
+      from auction_teams at
+      join team_members m on m.team_id = at.team_id
+     where at.auction_id = au.id
+    on conflict do nothing;
+    get diagnostics v_n = row_count;
+    update rooms set current_round_id = v_last, view = 'round' where id = p_room;
+  end if;
+
+  update auctions set status = 'finished', finished_at = clock_timestamp() where id = au.id;
+  return json_build_object('ok', true, 'members', v_n);
+end $$;
+
 create or replace function public.set_room_view(p_room uuid, p_view text) returns void
 language plpgsql security definer set search_path = public as $$
 begin
@@ -631,6 +914,8 @@ language plpgsql security definer set search_path = public as $$
 declare v_old uuid;
 begin
   if not is_admin() then raise exception 'No autorizado'; end if;
+  -- Una subasta sin terminar se liquida para que sus integrantes no pierdan el resultado.
+  perform finish_auction(p_room);
   for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
     perform reveal_round(v_old, true);
   end loop;
@@ -707,7 +992,7 @@ $$;
 
 -- Acumulado histórico por persona: suma todo lo ganado en cualquier sala marcada
 -- como «cuenta para el histórico», sin importar si sigue abierta o si la persona
--- ya no está dentro. p_game: null | 'emoji' | 'quiz' | 'taboo'
+-- ya no está dentro. p_game: null | 'emoji' | 'quiz' | 'taboo' | 'cipher' | 'auction'
 create or replace function public.global_scoreboard(p_game text default null)
 returns table(participant_id uuid, name text, points int, correct int, rooms int, rank int)
 language sql stable security definer set search_path = public as $$
@@ -772,6 +1057,7 @@ declare
   v_points int; v_rank int; v_players int; v_attempts int := 0; v_show boolean;
   v_team json; v_secret json; v_round_team json; v_describer text; v_mine boolean := false;
   v_cipher json; v_verse json;
+  au auctions; atm auction_teams; b auction_bids; v_auction json;
 begin
   select * into t from player_tokens where token = p_token;
   if not found then return null; end if;
@@ -825,6 +1111,52 @@ begin
     end if;
   end if;
 
+  -- Subasta: la que está en curso, o la que terminó en la ronda que se está mostrando.
+  select * into au from auctions
+   where room_id = t.room_id and (status = 'running' or id = rd.auction_id)
+   order by created_at desc limit 1;
+  if au.id is not null then
+    atm := auction_team_of(au.id, t.participant_id);
+    if rd.auction_id = au.id and atm.id is not null then
+      select * into b from auction_bids where round_id = rd.id and auction_team_id = atm.id;
+    end if;
+    v_auction := json_build_object(
+      'id', au.id, 'status', au.status, 'rounds_total', au.rounds_total,
+      'initial_balance', au.initial_balance,
+      'rounds_played', (select count(*) from rounds x where x.auction_id = au.id and x.prompt is not null),
+      'teams_total', (select count(*) from auction_teams x where x.auction_id = au.id),
+      'teams_bid', case when rd.auction_id = au.id
+                   then (select count(*) from auction_bids x where x.round_id = rd.id) else 0 end,
+      'teams_answered', case when rd.auction_id = au.id
+                   then (select count(*) from auction_bids x where x.round_id = rd.id and x.answered_at is not null) else 0 end,
+      'reference', case when rd.auction_id = au.id and rd.status = 'revealed'
+                   then (select q.reference from auction_questions q where q.id = rd.item_id) end,
+      'team', case when atm.id is null then null else json_build_object(
+        'id', atm.id, 'name', atm.name, 'seq', atm.seq, 'balance', atm.balance,
+        'max_bid', auction_max_bid(atm.balance),
+        'controller_id', atm.controller_id,
+        'controller_name', (select name from participants where id = atm.controller_id),
+        'controller_online', exists (select 1 from player_tokens pt
+                                      where pt.room_id = t.room_id and pt.participant_id = atm.controller_id
+                                        and pt.last_seen > clock_timestamp() - interval '20 seconds'),
+        'i_control', atm.controller_id = t.participant_id,
+        'members', (select coalesce(json_agg(p.name order by p.name), '[]'::json)
+                      from team_members m join participants p on p.id = m.participant_id
+                     where m.team_id = atm.team_id),
+        'rank', (select 1 + count(*) from auction_teams x where x.auction_id = au.id and x.balance > atm.balance),
+        'gain', greatest(0, atm.balance - au.initial_balance)) end,
+      -- La apuesta propia; la corrección solo se conoce al revelar.
+      'bid', case when b.round_id is null then null else json_build_object(
+        'amount', b.amount, 'auto', b.auto, 'answer_text', b.answer_text,
+        'answered', b.answered_at is not null,
+        'is_correct', case when rd.status = 'revealed' then coalesce(b.is_correct, false) end,
+        'delta', b.delta, 'balance_after', b.balance_after) end,
+      'standings', (select coalesce(json_agg(json_build_object('name', x.name, 'seq', x.seq, 'balance', x.balance)
+                                             order by x.balance desc, x.seq), '[]'::json)
+                      from auction_teams x where x.auction_id = au.id)
+    );
+  end if;
+
   return json_build_object(
     'server_now', clock_timestamp(),
     'room', json_build_object('id', r.id, 'name', r.name, 'status', r.status, 'view', r.view),
@@ -841,7 +1173,9 @@ begin
       'answer_text', rd.answer_text, 'correct_index', rd.correct_index,
       'team', v_round_team, 'describer_id', rd.describer_id, 'describer_name', v_describer,
       'my_turn', v_mine, 'i_describe', rd.describer_id = t.participant_id,
-      'secret', v_secret, 'cipher', v_cipher, 'verse', v_verse) end,
+      'secret', v_secret, 'cipher', v_cipher, 'verse', v_verse,
+      'auction_id', rd.auction_id, 'category', rd.category) end,
+    'auction', v_auction,
     'my_answer', case when a.id is null then null else json_build_object(
       'choice', a.choice, 'answer_text', a.answer_text,
       'is_correct', case when v_show then a.is_correct end,
@@ -1011,6 +1345,103 @@ begin
   return json_build_object('ok', true, 'correct', true, 'points', v_pts);
 end $$;
 
+-- SUBASTA — equipo del participante en la subasta de esa ronda (null si no tiene).
+create or replace function public.auction_team_of(p_auction uuid, p_participant uuid) returns auction_teams
+language sql stable security definer set search_path = public as $$
+  select at.* from auction_teams at
+    join team_members m on m.team_id = at.team_id and m.participant_id = p_participant
+   where at.auction_id = p_auction
+   limit 1;
+$$;
+
+-- SUBASTA — el controlador confirma la apuesta. No se puede cambiar después.
+create or replace function public.submit_auction_bid(p_token uuid, p_round uuid, p_amount int) returns json
+language plpgsql security definer set search_path = public as $$
+declare t player_tokens; rd rounds; at auction_teams; v_ok boolean;
+begin
+  select * into t from player_tokens where token = p_token;
+  if not found then raise exception 'Sesión inválida'; end if;
+  -- for share: espera a que termine un cierre de apuestas simultáneo.
+  select * into rd from rounds where id = p_round and room_id = t.room_id and game = 'auction' for share;
+  if not found then raise exception 'Ronda no válida'; end if;
+  if rd.status <> 'pending' or (select current_round_id from rooms where id = t.room_id) is distinct from rd.id then
+    return json_build_object('ok', false, 'reason', 'closed');
+  end if;
+  if clock_timestamp() > rd.deadline + interval '1 second' then
+    return json_build_object('ok', false, 'reason', 'timeout');
+  end if;
+  at := auction_team_of(rd.auction_id, t.participant_id);
+  if at.id is null then return json_build_object('ok', false, 'reason', 'no_team'); end if;
+  if at.controller_id is distinct from t.participant_id then
+    return json_build_object('ok', false, 'reason', 'not_controller');
+  end if;
+  if p_amount is null or p_amount < 20 or p_amount > auction_max_bid(at.balance) then
+    return json_build_object('ok', false, 'reason', 'range', 'max', auction_max_bid(at.balance));
+  end if;
+
+  insert into auction_bids(round_id, auction_team_id, amount)
+  values (rd.id, at.id, p_amount)
+  on conflict do nothing
+  returning true into v_ok;
+  if v_ok is null then return json_build_object('ok', false, 'reason', 'already'); end if;
+  return json_build_object('ok', true);
+end $$;
+
+-- SUBASTA — el controlador envía la única respuesta del equipo.
+-- No se dice si acertó hasta revelar, para que nadie la sople a otros equipos.
+create or replace function public.submit_auction_answer(p_token uuid, p_round uuid, p_text text) returns json
+language plpgsql security definer set search_path = public as $$
+declare t player_tokens; rd rounds; at auction_teams; q auction_questions; v_text text;
+begin
+  select * into t from player_tokens where token = p_token;
+  if not found then raise exception 'Sesión inválida'; end if;
+  select * into rd from rounds where id = p_round and room_id = t.room_id and game = 'auction' for share;
+  if not found then raise exception 'Ronda no válida'; end if;
+  if rd.status <> 'active' or (select current_round_id from rooms where id = t.room_id) is distinct from rd.id then
+    return json_build_object('ok', false, 'reason', 'closed');
+  end if;
+  if clock_timestamp() > rd.deadline + interval '1 second' then
+    return json_build_object('ok', false, 'reason', 'timeout');
+  end if;
+  at := auction_team_of(rd.auction_id, t.participant_id);
+  if at.id is null then return json_build_object('ok', false, 'reason', 'no_team'); end if;
+  if at.controller_id is distinct from t.participant_id then
+    return json_build_object('ok', false, 'reason', 'not_controller');
+  end if;
+  v_text := left(trim(coalesce(p_text, '')), 80);
+  if v_text = '' then return json_build_object('ok', false, 'reason', 'empty'); end if;
+
+  select * into q from auction_questions where id = rd.item_id;
+  update auction_bids
+     set answer_text = v_text,
+         is_correct  = answer_matches(v_text, array_prepend(q.answer, q.aliases)),
+         answered_at = clock_timestamp()
+   where round_id = rd.id and auction_team_id = at.id and answered_at is null;
+  if not found then return json_build_object('ok', false, 'reason', 'already'); end if;
+  return json_build_object('ok', true);
+end $$;
+
+-- SUBASTA — si el celular controlador se desconecta, otro integrante toma el control.
+create or replace function public.claim_auction_control(p_token uuid) returns json
+language plpgsql security definer set search_path = public as $$
+declare t player_tokens; au auctions; at auction_teams;
+begin
+  select * into t from player_tokens where token = p_token;
+  if not found then raise exception 'Sesión inválida'; end if;
+  select * into au from auctions where room_id = t.room_id and status = 'running';
+  if not found then return json_build_object('ok', false, 'reason', 'not_running'); end if;
+  at := auction_team_of(au.id, t.participant_id);
+  if at.id is null then return json_build_object('ok', false, 'reason', 'no_team'); end if;
+  if at.controller_id = t.participant_id then return json_build_object('ok', true); end if;
+  if exists (select 1 from player_tokens pt
+              where pt.room_id = t.room_id and pt.participant_id = at.controller_id
+                and pt.last_seen > clock_timestamp() - interval '20 seconds') then
+    return json_build_object('ok', false, 'reason', 'controller_online');
+  end if;
+  update auction_teams set controller_id = t.participant_id where id = at.id;
+  return json_build_object('ok', true);
+end $$;
+
 -- ---------------------------------------------------------------------
 -- SEGURIDAD (RLS)
 -- ---------------------------------------------------------------------
@@ -1029,6 +1460,10 @@ alter table public.taboo_items    enable row level security;
 alter table public.cipher_items   enable row level security;
 alter table public.teams          enable row level security;
 alter table public.team_members   enable row level security;
+alter table public.auction_questions enable row level security;
+alter table public.auctions       enable row level security;
+alter table public.auction_teams  enable row level security;
+alter table public.auction_bids   enable row level security;
 
 drop policy if exists admins_self on public.admins;
 create policy admins_self on public.admins for select to authenticated using (user_id = auth.uid());
@@ -1060,6 +1495,23 @@ create policy team_members_read on public.team_members for select to anon, authe
 drop policy if exists team_members_admin on public.team_members;
 create policy team_members_admin on public.team_members for all to authenticated using (is_admin()) with check (is_admin());
 
+drop policy if exists auction_questions_admin on public.auction_questions;
+create policy auction_questions_admin on public.auction_questions for all to authenticated using (is_admin()) with check (is_admin());
+
+-- Saldos y equipos de la subasta son públicos; las apuestas y respuestas no.
+drop policy if exists auctions_read on public.auctions;
+create policy auctions_read on public.auctions for select to anon, authenticated using (true);
+drop policy if exists auctions_admin on public.auctions;
+create policy auctions_admin on public.auctions for all to authenticated using (is_admin()) with check (is_admin());
+
+drop policy if exists auction_teams_read on public.auction_teams;
+create policy auction_teams_read on public.auction_teams for select to anon, authenticated using (true);
+drop policy if exists auction_teams_admin on public.auction_teams;
+create policy auction_teams_admin on public.auction_teams for all to authenticated using (is_admin()) with check (is_admin());
+
+drop policy if exists auction_bids_admin on public.auction_bids;
+create policy auction_bids_admin on public.auction_bids for all to authenticated using (is_admin()) with check (is_admin());
+
 drop policy if exists rooms_read on public.rooms;
 create policy rooms_read on public.rooms for select to anon, authenticated using (true);
 drop policy if exists rooms_admin on public.rooms;
@@ -1084,12 +1536,13 @@ create policy answers_admin on public.answers for all to authenticated using (is
 
 grant usage on schema public to anon, authenticated;
 grant select on public.participants, public.rooms, public.room_players, public.rounds,
-  public.teams, public.team_members to anon;
+  public.teams, public.team_members, public.auctions, public.auction_teams to anon;
 grant select, insert, update, delete on
   public.participants, public.emoji_items, public.quiz_questions, public.taboo_items,
   public.cipher_items, public.rooms,
   public.room_codes, public.room_players, public.rounds, public.answers,
-  public.teams, public.team_members to authenticated;
+  public.teams, public.team_members,
+  public.auction_questions, public.auctions, public.auction_teams, public.auction_bids to authenticated;
 grant select on public.admins to authenticated;
 revoke all on public.player_tokens from anon, authenticated;
 
@@ -1098,19 +1551,28 @@ revoke execute on function public.create_room(text), public.reveal_round(uuid, b
   public.release_player(uuid, uuid), public.room_players_status(uuid), public.claim_admin(),
   public.assign_teams(uuid, int), public.set_team(uuid, uuid, uuid), public.rename_team(uuid, text),
   public.start_taboo_round(uuid, text, uuid), public.start_taboo_timer(uuid),
-  public.stop_taboo(uuid, boolean) from anon, public;
+  public.stop_taboo(uuid, boolean),
+  public.start_auction(uuid, int, boolean), public.start_auction_round(uuid, text),
+  public.close_auction_bids(uuid, boolean), public.finish_auction(uuid) from anon, public;
+-- Internas: solo se llaman desde otras funciones.
+revoke execute on function public.settle_auction_round(uuid), public.pick_auction_controller(uuid, uuid)
+  from anon, authenticated, public;
 grant execute on function public.create_room(text), public.reveal_round(uuid, boolean), public.start_round(uuid, text, text),
   public.reveal_clue(uuid), public.set_room_view(uuid, text), public.close_room(uuid),
   public.release_player(uuid, uuid), public.room_players_status(uuid), public.claim_admin(),
   public.assign_teams(uuid, int), public.set_team(uuid, uuid, uuid), public.rename_team(uuid, text),
   public.start_taboo_round(uuid, text, uuid), public.start_taboo_timer(uuid),
-  public.stop_taboo(uuid, boolean) to authenticated;
+  public.stop_taboo(uuid, boolean),
+  public.start_auction(uuid, int, boolean), public.start_auction_round(uuid, text),
+  public.close_auction_bids(uuid, boolean), public.finish_auction(uuid) to authenticated;
 grant execute on function public.server_now(), public.room_scoreboard(uuid, text), public.lookup_room(text),
   public.join_room(text, uuid), public.player_state(uuid), public.submit_emoji(uuid, uuid, text),
   public.submit_quiz(uuid, uuid, int), public.is_admin(),
   public.submit_cipher(uuid, uuid, text), public.submit_verse(uuid, uuid, text, int, int),
   public.room_team_scoreboard(uuid), public.room_teams(uuid),
-  public.global_scoreboard(text) to anon, authenticated;
+  public.global_scoreboard(text),
+  public.submit_auction_bid(uuid, uuid, int), public.submit_auction_answer(uuid, uuid, text),
+  public.claim_auction_control(uuid) to anon, authenticated;
 
 -- ---------------------------------------------------------------------
 -- REALTIME
@@ -1118,7 +1580,8 @@ grant execute on function public.server_now(), public.room_scoreboard(uuid, text
 do $$
 declare tbl text;
 begin
-  foreach tbl in array array['rooms','rounds','room_players','answers','teams','team_members'] loop
+  foreach tbl in array array['rooms','rounds','room_players','answers','teams','team_members',
+                           'auctions','auction_teams','auction_bids'] loop
     if not exists (select 1 from pg_publication_tables
                     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = tbl) then
       execute format('alter publication supabase_realtime add table public.%I', tbl);
@@ -1349,5 +1812,88 @@ insert into public.cipher_items (difficulty, kind, puzzle, hint, answer, aliases
  'Encuentra el versículo que dice que Jehová está en medio de ti, poderoso, y él salvará.','Sofonías',3,17),
 ('dificil','numeros','5 - 19 - 20 - 5 - 2 - 1 - 14','A = 1, B = 2, C = 3… hasta Z = 26','Esteban','{}',
  'Encuentra el versículo donde pide: «Señor, no les tomes en cuenta este pecado».','Hechos',7,60);
+end if;
+end $$;
+
+do $$ begin
+if not exists (select 1 from public.auction_questions) then
+insert into public.auction_questions (category, difficulty, question, answer, aliases, reference) values
+-- PERSONAJES DEL ANTIGUO TESTAMENTO
+('Personajes del Antiguo Testamento','facil','¿Quién fue vendido por sus hermanos y llegó a gobernar en Egipto?','José','{jose hijo de jacob}','Génesis 37–41'),
+('Personajes del Antiguo Testamento','facil','¿Cómo se llamaba el hermano que mató a Abel?','Caín','{cain}','Génesis 4:8'),
+('Personajes del Antiguo Testamento','intermedio','¿Qué hijo de Jacob propuso vender a José en lugar de matarlo?','Judá','{juda}','Génesis 37:26-27'),
+('Personajes del Antiguo Testamento','intermedio','¿Cómo se llamaba el suegro de Moisés, sacerdote de Madián?','Jetro','{reuel,ragüel,raguel}','Éxodo 3:1; 18:1'),
+('Personajes del Antiguo Testamento','dificil','¿Quién caminó con Dios y desapareció porque Dios se lo llevó?','Enoc','{henoc,enoch}','Génesis 5:24'),
+('Personajes del Antiguo Testamento','dificil','¿Qué espía, junto con Josué, trajo un buen informe de la tierra prometida?','Caleb','{}','Números 13:30; 14:6-9'),
+-- PROFETAS
+('Profetas','facil','¿Qué profeta subió al cielo en un torbellino?','Elías','{elias}','2 Reyes 2:11'),
+('Profetas','facil','¿A qué profeta envió Dios a predicar a Nínive?','Jonás','{jonas}','Jonás 1:1-2'),
+('Profetas','intermedio','¿Qué profeta pidió una doble porción del espíritu de Elías?','Eliseo','{}','2 Reyes 2:9'),
+('Profetas','intermedio','¿Qué profeta vio en visión un valle lleno de huesos secos?','Ezequiel','{}','Ezequiel 37:1-14'),
+('Profetas','dificil','¿Qué profeta se casó con Gomer por mandato de Dios?','Oseas','{}','Oseas 1:2-3'),
+('Profetas','dificil','¿Qué profeta era pastor de Tecoa y recogía higos silvestres?','Amós','{amos}','Amós 1:1; 7:14'),
+-- LUGARES BÍBLICOS
+('Lugares bíblicos','facil','¿En qué huerto puso Dios a Adán y Eva?','Edén','{eden,jardin del eden,huerto del eden}','Génesis 2:8'),
+('Lugares bíblicos','facil','¿Qué ciudad amurallada cayó cuando el pueblo tocó las trompetas y gritó?','Jericó','{jerico}','Josué 6:20'),
+('Lugares bíblicos','intermedio','¿En qué monte recibió Moisés los Diez Mandamientos?','Sinaí','{sinai,monte sinai,horeb}','Éxodo 19–20'),
+('Lugares bíblicos','intermedio','¿En qué río se zambulló Naamán siete veces para ser sanado?','Jordán','{jordan,rio jordan}','2 Reyes 5:14'),
+('Lugares bíblicos','dificil','¿En qué monte desafió Elías a los profetas de Baal?','Carmelo','{monte carmelo}','1 Reyes 18:19-20'),
+('Lugares bíblicos','dificil','¿En qué ciudad llamaron cristianos a los discípulos por primera vez?','Antioquía','{antioquia}','Hechos 11:26'),
+-- NUEVO TESTAMENTO
+('Nuevo Testamento','facil','¿Quién bautizó a Jesús en el río Jordán?','Juan el Bautista','{juan bautista,bautista,juan}','Mateo 3:13'),
+('Nuevo Testamento','facil','¿Qué discípulo no creyó en la resurrección hasta ver las heridas de Jesús?','Tomás','{tomas,dídimo,didimo}','Juan 20:24-29'),
+('Nuevo Testamento','intermedio','¿Qué fariseo visitó a Jesús de noche?','Nicodemo','{}','Juan 3:1-2'),
+('Nuevo Testamento','intermedio','¿Quién fue elegido para ocupar el lugar de Judas entre los doce?','Matías','{matias}','Hechos 1:26'),
+('Nuevo Testamento','dificil','¿Cómo se llamaba el mago de Samaria que quiso comprar con dinero el don del Espíritu Santo?','Simón','{simon el mago,simon mago}','Hechos 8:9-24'),
+('Nuevo Testamento','dificil','¿Qué discípula de Jope, llena de buenas obras, fue resucitada por Pedro?','Tabita','{dorcas}','Hechos 9:36-41'),
+-- ¿QUIÉN LO DIJO?
+('¿Quién lo dijo?','facil','«Heme aquí, envíame a mí.»','Isaías','{isaias}','Isaías 6:8'),
+('¿Quién lo dijo?','facil','«Habla, porque tu siervo oye.»','Samuel','{}','1 Samuel 3:10'),
+('¿Quién lo dijo?','intermedio','«¿Soy yo acaso guarda de mi hermano?»','Caín','{cain}','Génesis 4:9'),
+('¿Quién lo dijo?','intermedio','«Tu pueblo será mi pueblo, y tu Dios mi Dios.»','Rut','{ruth}','Rut 1:16'),
+('¿Quién lo dijo?','dificil','«Si perezco, que perezca.»','Ester','{esther,reina ester}','Ester 4:16'),
+('¿Quién lo dijo?','dificil','«Por poco me persuades a ser cristiano.»','Agripa','{rey agripa,herodes agripa}','Hechos 26:28'),
+-- REYES
+('Reyes','facil','¿Qué rey pidió a Dios sabiduría para gobernar al pueblo?','Salomón','{salomon}','1 Reyes 3:9'),
+('Reyes','facil','¿Qué rey, que antes cuidaba ovejas, escribió muchos de los Salmos?','David','{rey david}','1 Samuel 16:11-13'),
+('Reyes','intermedio','¿Qué rey de Babilonia soñó con una gran estatua?','Nabucodonosor','{}','Daniel 2:31'),
+('Reyes','intermedio','¿Qué rey de Israel se casó con Jezabel?','Acab','{ajab}','1 Reyes 16:30-31'),
+('Reyes','dificil','¿Qué rey de Judá oró enfermo y Dios le añadió quince años de vida?','Ezequías','{ezequias}','2 Reyes 20:1-6'),
+('Reyes','dificil','¿Qué rey comenzó a reinar a los ocho años y halló el libro de la ley en el templo?','Josías','{josias}','2 Reyes 22:1-8'),
+-- MILAGROS
+('Milagros','facil','¿Qué hizo Jesús en su primer milagro, en unas bodas en Caná?','Convirtió el agua en vino','{agua en vino,convertir el agua en vino,el agua en vino}','Juan 2:1-11'),
+('Milagros','facil','¿Cuántos panes usó Jesús para alimentar a los cinco mil?','Cinco','{5,cinco panes,5 panes}','Mateo 14:17-21'),
+('Milagros','intermedio','¿A quién resucitó Jesús cuando llevaba cuatro días en el sepulcro?','Lázaro','{lazaro}','Juan 11:39-44'),
+('Milagros','intermedio','¿Qué profeta hizo flotar el hierro de un hacha?','Eliseo','{}','2 Reyes 6:5-7'),
+('Milagros','dificil','¿Sobre qué ciudad mandó Josué que se detuviera el sol?','Gabaón','{gabaon}','Josué 10:12-13'),
+('Milagros','dificil','¿Qué ciego de Jericó gritó «Hijo de David, ten misericordia de mí» y recibió la vista?','Bartimeo','{ciego bartimeo}','Marcos 10:46-52'),
+-- PARÁBOLAS DE JESÚS
+('Parábolas de Jesús','facil','¿Qué buscó el pastor que dejó a las noventa y nueve en el desierto?','Una oveja','{oveja,oveja perdida,la oveja perdida}','Lucas 15:4'),
+('Parábolas de Jesús','facil','¿Cómo se conoce al hijo que pidió su herencia y la malgastó lejos de casa?','El hijo pródigo','{hijo prodigo,prodigo,hijo menor}','Lucas 15:11-32'),
+('Parábolas de Jesús','intermedio','En la parábola del sembrador, ¿qué es la semilla?','La palabra de Dios','{palabra,la palabra}','Lucas 8:11'),
+('Parábolas de Jesús','intermedio','En la parábola de las diez vírgenes, ¿cuántas eran prudentes?','Cinco','{5}','Mateo 25:2'),
+('Parábolas de Jesús','dificil','En la parábola de los talentos, ¿qué hizo el siervo que recibió un solo talento?','Lo enterró','{enterro,lo escondio,lo escondio en la tierra,lo escondio bajo tierra,lo enterro en la tierra}','Mateo 25:18'),
+('Parábolas de Jesús','dificil','¿Cómo se llamaba el mendigo de la parábola del rico?','Lázaro','{lazaro}','Lucas 16:20'),
+-- MUJERES DE LA BIBLIA
+('Mujeres de la Biblia','facil','¿Cómo se llamaba la primera mujer?','Eva','{}','Génesis 3:20'),
+('Mujeres de la Biblia','facil','¿Cómo se llamaba la esposa de Abraham?','Sara','{sarai}','Génesis 17:15'),
+('Mujeres de la Biblia','intermedio','¿Qué mujer escondió a los espías en Jericó?','Rahab','{rajab}','Josué 2:1-6'),
+('Mujeres de la Biblia','intermedio','¿Qué hermana de Moisés cantó con pandero después de cruzar el mar Rojo?','María','{maria,miriam}','Éxodo 15:20'),
+('Mujeres de la Biblia','dificil','¿Qué vendedora de púrpura, de Tiatira, creyó al oír a Pablo?','Lidia','{}','Hechos 16:14'),
+('Mujeres de la Biblia','dificil','¿Qué profetisa anciana habló del niño Jesús en el templo?','Ana','{profetisa ana}','Lucas 2:36-38'),
+-- NÚMEROS EN LA BIBLIA
+('Números en la Biblia','facil','¿En cuántos días creó Dios todo antes de descansar?','Seis','{6,seis dias,6 dias}','Génesis 1:31–2:2'),
+('Números en la Biblia','facil','¿Cuántas tribus formaban el pueblo de Israel?','Doce','{12,doce tribus}','Génesis 49:28'),
+('Números en la Biblia','intermedio','¿Cuántos días estuvo Jonás en el vientre del gran pez?','Tres','{3,tres dias,3 dias}','Jonás 1:17'),
+('Números en la Biblia','intermedio','¿Cuántas veces dijo Jesús que hay que perdonar al hermano?','Setenta veces siete','{70 veces 7,490,setenta veces 7}','Mateo 18:22'),
+('Números en la Biblia','dificil','¿Cuántos años vivió Matusalén?','969','{novecientos sesenta y nueve}','Génesis 5:27'),
+('Números en la Biblia','dificil','¿Con cuántos hombres venció Gedeón a los madianitas?','300','{trescientos,300 hombres}','Jueces 7:7'),
+-- LIBROS DE LA BIBLIA
+('Libros de la Biblia','facil','¿Qué libro de la Biblia tiene 150 capítulos?','Salmos','{los salmos,salmo}','Salmos'),
+('Libros de la Biblia','facil','¿Qué libro cuenta la creación del mundo?','Génesis','{genesis}','Génesis 1'),
+('Libros de la Biblia','intermedio','¿Qué libro cuenta cómo nació y creció la iglesia después de la ascensión de Jesús?','Hechos','{hechos de los apostoles}','Hechos 1–28'),
+('Libros de la Biblia','intermedio','¿Qué libro cuenta cómo una reina judía salvó a su pueblo en Persia?','Ester','{esther}','Ester 1–10'),
+('Libros de la Biblia','dificil','¿Cuál es el libro más corto del Antiguo Testamento?','Abdías','{abdias}','Abdías 1'),
+('Libros de la Biblia','dificil','¿Qué carta escribió Pablo para pedir que recibieran de vuelta al esclavo Onésimo?','Filemón','{filemon}','Filemón 1:10-17');
 end if;
 end $$;

@@ -15,6 +15,7 @@ import {
   type Room, type RoomView, type Round, type ScoreRow, type TabooItem, type Team, type TeamScoreRow,
 } from '../../lib/types'
 import TeamsDrawer, { suggestedTeams } from './TeamsDrawer'
+import { AuctionLauncher, AuctionRoundStage, AuctionTeamsStage, useAuction } from './AuctionStage'
 
 type Remaining = Record<Game, Record<Difficulty, number>>
 type BoardView = Game | 'teams' | null
@@ -41,6 +42,7 @@ export default function RoomConsole() {
   const [remaining, setRemaining] = useState<Remaining | null>(null)
   const [game, setGame] = useState<Game>('emoji')
   const [difficulty, setDifficulty] = useState<Difficulty>('facil')
+  const [auctionMix, setAuctionMix] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [showControls, setShowControls] = useState(true)
@@ -95,17 +97,18 @@ export default function RoomConsole() {
   }, [roomId])
 
   const loadRemaining = useCallback(async () => {
-    const [{ data: e }, { data: q }, { data: tb }, { data: ci }, { data: used }] = await Promise.all([
+    const [{ data: e }, { data: q }, { data: tb }, { data: ci }, { data: au }, { data: used }] = await Promise.all([
       supabase.from('emoji_items').select('id, difficulty'),
       supabase.from('quiz_questions').select('id, difficulty'),
       supabase.from('taboo_items').select('id, difficulty'),
       supabase.from('cipher_items').select('id, difficulty'),
+      supabase.from('auction_questions').select('id, difficulty'),
       supabase.from('rounds').select('item_id').eq('room_id', roomId),
     ])
     const usedSet = new Set((used ?? []).map((u) => u.item_id))
     const count = (rows: { id: string; difficulty: Difficulty }[] | null) =>
       Object.fromEntries(DIFFICULTIES.map((d) => [d, (rows ?? []).filter((x) => x.difficulty === d && !usedSet.has(x.id)).length])) as Record<Difficulty, number>
-    setRemaining({ emoji: count(e), quiz: count(q), taboo: count(tb), cipher: count(ci) })
+    setRemaining({ emoji: count(e), quiz: count(q), taboo: count(tb), cipher: count(ci), auction: count(au) })
   }, [roomId])
 
   const roundId = round?.id ?? null
@@ -162,10 +165,14 @@ export default function RoomConsole() {
     await loadRoom()
   }, [loadRoom])
 
+  const auction = useAuction(roomId, round, now, run, loadRoom)
+
   const startRound = useCallback(async (g: Game = game, d: Difficulty = difficulty) => {
     setGame(g)
     setDifficulty(d)
-    if (g === 'taboo') {
+    if (g === 'auction') {
+      await auction.next(auctionMix ? null : d)
+    } else if (g === 'taboo') {
       if (!teamId) return setError('Primero arma los equipos desde «🤝 Equipos».')
       await run(() => supabase.rpc('start_taboo_round', { p_room: roomId, p_difficulty: d, p_team: teamId }))
       // el turno pasa solo al siguiente equipo
@@ -175,7 +182,7 @@ export default function RoomConsole() {
       await run(() => supabase.rpc('start_round', { p_room: roomId, p_game: g, p_difficulty: d }))
     }
     loadRemaining()
-  }, [game, difficulty, run, roomId, loadRemaining, teamId, teams])
+  }, [game, difficulty, run, roomId, loadRemaining, teamId, teams, auction, auctionMix])
 
   const startTaboo = useCallback(() => {
     if (round?.game === 'taboo' && round.status === 'pending') {
@@ -223,6 +230,7 @@ export default function RoomConsole() {
   const autoRevealed = useRef<string | null>(null)
   useEffect(() => {
     if (!round || round.status !== 'active' || autoRevealed.current === round.id) return
+    if (round.game === 'auction') return // lo maneja useAuction
     if (now < new Date(round.started_at).getTime()) return
     const correctCount = roundAnswers.filter((a) => a.is_correct).length
 
@@ -284,12 +292,13 @@ export default function RoomConsole() {
         e.preventDefault()
         if (round?.status === 'active' && round.game === 'emoji') nextClue()
         else if (round?.game === 'taboo' && round.status === 'pending') startTaboo()
+        else if (round?.game === 'auction' && round.status === 'pending') auction.closeBids()
         else if (room?.view !== 'podium') startRound()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [room?.view, round, nextClue, reveal, setView, startRound, startTaboo, stopTaboo])
+  }, [room?.view, round, nextClue, reveal, setView, startRound, startTaboo, stopTaboo, auction])
 
   if (notFound) {
     return <div className="p-10 text-center">Sala no encontrada. <Link className="text-amber-300 underline" to="/admin">Volver</Link></div>
@@ -297,7 +306,9 @@ export default function RoomConsole() {
   if (!room) return <div className="flex min-h-dvh items-center justify-center"><Spinner label="Cargando sala…" /></div>
 
   const closed = room.status === 'closed'
-  const view: RoomView = closed ? 'podium' : room.view === 'round' && !round ? 'lobby' : room.view
+  // Con una subasta recién iniciada aún no hay ronda: se muestran los equipos.
+  const view: RoomView = closed ? 'podium' : room.view === 'round' && !round && !auction.running ? 'lobby' : room.view
+  const auctionTeamsUp = !!auction.running && (!round || round.auction_id !== auction.running.id)
 
   return (
     <div className="flex min-h-dvh flex-col">
@@ -318,7 +329,7 @@ export default function RoomConsole() {
         <button className="btn-secondary px-3 py-2" onClick={() => setShowPlayers(true)}>
           👥 {players.length}
         </button>
-        <button className="btn-secondary px-3 py-2" onClick={() => setShowTeams(true)} title="Equipos de Tabú">
+        <button className="btn-secondary px-3 py-2" onClick={() => setShowTeams(true)} title="Equipos">
           🤝 {teams.length || '—'}
         </button>
         <button className="btn-secondary hidden px-3 py-2 sm:inline-flex" onClick={toggleFullscreen} title="Pantalla completa (F)">⛶</button>
@@ -339,12 +350,18 @@ export default function RoomConsole() {
         {view === 'round' && round && round.game === 'cipher' && (
           <CipherStage round={round} item={cipherItem} peek={peek} answers={roundAnswers} players={players} now={now} />
         )}
+        {view === 'round' && auctionTeamsUp && (
+          <AuctionTeamsStage data={auction} roomTeams={teams} players={players} now={now} />
+        )}
+        {view === 'round' && !auctionTeamsUp && round?.game === 'auction' && (
+          <AuctionRoundStage data={auction} round={round} roomTeams={teams} peek={peek} now={now} />
+        )}
         {view === 'leaderboard' && (
           <div className="mx-auto w-full max-w-5xl">
             <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
               <h1 className="font-display text-4xl font-bold sm:text-5xl">📊 Tabla de posiciones</h1>
               <div className="flex flex-wrap gap-2">
-                {([null, 'emoji', 'quiz', 'taboo', 'teams'] as const).map((g) => (
+                {([null, ...GAMES, 'teams'] as const).map((g) => (
                   <button key={g ?? 'all'} onClick={() => setBoardGame(g)}
                     className={`btn px-4 py-2 ${boardGame === g ? 'bg-white text-indigo-950' : 'bg-white/10'}`}>
                     {g === null ? 'General' : g === 'teams' ? '🤝 Equipos' : GAME_LABEL[g]}
@@ -395,7 +412,12 @@ export default function RoomConsole() {
                     <button className="btn-secondary" onClick={() => stopTaboo(false)} disabled={busy}>⏹️ No adivinaron</button>
                   </>
                 )}
-                {view === 'round' && round && round.status !== 'revealed' && (round.game === 'taboo' || round.game === 'cipher') && (
+                {view === 'round' && round?.game === 'auction' && round.status === 'pending' && (
+                  <button className="btn-primary px-6 text-lg" onClick={auction.closeBids} disabled={busy} title="Espacio">
+                    🔒 Cerrar apuestas y mostrar pregunta
+                  </button>
+                )}
+                {view === 'round' && round && round.status !== 'revealed' && (round.game === 'taboo' || round.game === 'cipher' || round.game === 'auction') && (
                   <button className="btn-ghost px-3 py-2 text-sm" onClick={() => setPeek((p) => !p)}>
                     {peek ? '🙈 Ocultar respuesta' : '👁️ Ver respuesta'}
                   </button>
@@ -413,7 +435,13 @@ export default function RoomConsole() {
                     </button>
                   ))}
                   <span className="mx-1 h-6 w-px bg-white/15" />
-                  {DIFFICULTIES.map((d) => (
+                  {game === 'auction' ? (
+                    <AuctionLauncher
+                      data={auction} round={round} difficulty={difficulty} setDifficulty={setDifficulty}
+                      mix={auctionMix} setMix={setAuctionMix} remaining={remaining?.auction ?? null}
+                      busy={busy} players={players.length} roomTeams={teams.length}
+                    />
+                  ) : DIFFICULTIES.map((d) => (
                     <button key={d} onClick={() => setDifficulty(d)}
                       className={`btn px-3 py-2 text-sm ${difficulty === d ? 'bg-white text-indigo-950' : 'bg-transparent text-indigo-200 hover:bg-white/10'}`}>
                       {DIFFICULTY_LABEL[d]} <span className="opacity-60">{remaining?.[game][d] ?? '–'}</span>
@@ -433,14 +461,16 @@ export default function RoomConsole() {
                       </select>
                     </>
                   )}
-                  <button
-                    className={`${round?.status === 'active' ? 'btn-secondary' : 'btn-primary'} px-5 py-2`}
-                    onClick={() => startRound()}
-                    disabled={busy || !remaining || remaining[game][difficulty] === 0 || (game === 'taboo' && !teamId)}
-                    title="Espacio"
-                  >
-                    ▶ {view === 'round' && round ? 'Siguiente ronda' : 'Iniciar juego'}
-                  </button>
+                  {game !== 'auction' && (
+                    <button
+                      className={`${round?.status === 'active' ? 'btn-secondary' : 'btn-primary'} px-5 py-2`}
+                      onClick={() => startRound()}
+                      disabled={busy || !remaining || remaining[game][difficulty] === 0 || (game === 'taboo' && !teamId) || !!auction.running}
+                      title={auction.running ? 'Termina la subasta para cambiar de juego' : 'Espacio'}
+                    >
+                      ▶ {view === 'round' && round ? 'Siguiente ronda' : 'Iniciar juego'}
+                    </button>
+                  )}
                 </div>
 
                 {/* vistas */}

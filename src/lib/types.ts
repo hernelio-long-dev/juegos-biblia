@@ -1,5 +1,5 @@
 export type Difficulty = 'facil' | 'intermedio' | 'dificil'
-export type Game = 'emoji' | 'quiz' | 'taboo' | 'cipher'
+export type Game = 'emoji' | 'quiz' | 'taboo' | 'cipher' | 'auction'
 export type CipherKind = 'numeros' | 'reverso' | 'anagrama' | 'desplazado' | 'sin_vocales' | 'acertijo' | 'frase'
 export type RoomView = 'lobby' | 'round' | 'leaderboard' | 'podium'
 export type RoundStatus = 'pending' | 'active' | 'revealed'
@@ -18,20 +18,21 @@ export const DIFFICULTY_STYLE: Record<Difficulty, string> = {
   dificil: 'bg-rose-400/20 text-rose-200',
 }
 
-export const GAMES: Game[] = ['emoji', 'quiz', 'taboo', 'cipher']
+export const GAMES: Game[] = ['emoji', 'quiz', 'taboo', 'cipher', 'auction']
 
 export const GAME_LABEL: Record<Game, string> = {
   emoji: 'Adivina con emojis',
   quiz: 'Selección múltiple',
   taboo: 'Tabú bíblico',
   cipher: 'Código secreto bíblico',
+  auction: 'Subasta bíblica',
 }
 
 export const GAME_SHORT: Record<Game, string> = {
-  emoji: 'Emojis', quiz: 'Selección', taboo: 'Tabú', cipher: 'Código',
+  emoji: 'Emojis', quiz: 'Selección', taboo: 'Tabú', cipher: 'Código', auction: 'Subasta',
 }
 
-export const GAME_ICON: Record<Game, string> = { emoji: '😀', quiz: '❓', taboo: '🤫', cipher: '🔐' }
+export const GAME_ICON: Record<Game, string> = { emoji: '😀', quiz: '❓', taboo: '🤫', cipher: '🔐', auction: '🔨' }
 
 export const CIPHER_KINDS: CipherKind[] = ['numeros', 'reverso', 'anagrama', 'desplazado', 'sin_vocales', 'acertijo', 'frase']
 
@@ -50,6 +51,8 @@ export const EMOJI_FINAL_SECONDS = 30
 export const TABOO_SECONDS = 45
 export const CIPHER_SECONDS = 60
 export const VERSE_SECONDS = 60
+export const AUCTION_BID_SECONDS = 30
+export const AUCTION_ANSWER_SECONDS = 40
 
 // Deben coincidir con emoji_points / quiz_points / taboo_points en supabase/schema.sql
 export const EMOJI_TIERS = [100, 70, 50, 30]
@@ -61,6 +64,17 @@ export const CIPHER_BASE = 20
 export const CIPHER_PER_SECOND = 1
 export const VERSE_BASE = 10
 export const VERSE_PER_SECOND = 0.5
+// Subasta: deben coincidir con start_auction / auction_max_bid / close_auction_bids en schema.sql
+export const AUCTION_START_BALANCE = 300
+export const AUCTION_MIN_BID = 20
+export const AUCTION_MAX_BID = 150
+
+/** Categorías sugeridas; el banco acepta otras escritas a mano. */
+export const AUCTION_CATEGORIES = [
+  'Personajes del Antiguo Testamento', 'Profetas', 'Lugares bíblicos', 'Nuevo Testamento',
+  '¿Quién lo dijo?', 'Reyes', 'Milagros', 'Parábolas de Jesús', 'Mujeres de la Biblia',
+  'Números en la Biblia', 'Libros de la Biblia',
+]
 
 /** Los 66 libros, en el orden y con la ortografía de Reina-Valera. */
 export const BIBLE_BOOKS = [
@@ -75,7 +89,7 @@ export const BIBLE_BOOKS = [
   '1 Juan', '2 Juan', '3 Juan', 'Judas', 'Apocalipsis',
 ] as const
 
-/** Colores de los equipos de Tabú, por número de equipo. */
+/** Colores de los equipos, por número de equipo. */
 export const TEAM_STYLES = [
   { bg: 'bg-rose-500', soft: 'bg-rose-500/20 text-rose-100', text: 'text-rose-300' },
   { bg: 'bg-sky-500', soft: 'bg-sky-500/20 text-sky-100', text: 'text-sky-300' },
@@ -83,6 +97,12 @@ export const TEAM_STYLES = [
   { bg: 'bg-amber-500', soft: 'bg-amber-500/20 text-amber-100', text: 'text-amber-300' },
   { bg: 'bg-violet-500', soft: 'bg-violet-500/20 text-violet-100', text: 'text-violet-300' },
   { bg: 'bg-teal-500', soft: 'bg-teal-500/20 text-teal-100', text: 'text-teal-300' },
+  { bg: 'bg-fuchsia-500', soft: 'bg-fuchsia-500/20 text-fuchsia-100', text: 'text-fuchsia-300' },
+  { bg: 'bg-lime-500', soft: 'bg-lime-500/20 text-lime-100', text: 'text-lime-300' },
+  { bg: 'bg-orange-500', soft: 'bg-orange-500/20 text-orange-100', text: 'text-orange-300' },
+  { bg: 'bg-cyan-500', soft: 'bg-cyan-500/20 text-cyan-100', text: 'text-cyan-300' },
+  { bg: 'bg-pink-500', soft: 'bg-pink-500/20 text-pink-100', text: 'text-pink-300' },
+  { bg: 'bg-indigo-400', soft: 'bg-indigo-400/20 text-indigo-100', text: 'text-indigo-300' },
 ]
 
 export const teamStyle = (seq: number) => TEAM_STYLES[(seq - 1) % TEAM_STYLES.length]
@@ -112,6 +132,8 @@ export interface Round {
   options: string[] | null
   team_id: string | null
   describer_id: string | null
+  auction_id: string | null
+  category: string | null
   started_at: string
   deadline: string | null
   answer_text: string | null
@@ -139,6 +161,49 @@ export interface CipherItem {
   verse_chapter: number
   verse_from: number
   verse_to: number | null
+}
+
+export interface AuctionQuestion {
+  id: string
+  category: string
+  difficulty: Difficulty
+  question: string
+  answer: string
+  aliases: string[]
+  reference: string | null
+}
+
+export interface Auction {
+  id: string
+  room_id: string
+  status: 'running' | 'finished'
+  rounds_total: number
+  initial_balance: number
+  created_at: string
+  finished_at: string | null
+}
+
+export interface AuctionTeam {
+  id: string
+  auction_id: string
+  team_id: string | null
+  name: string
+  seq: number
+  balance: number
+  controller_id: string | null
+}
+
+export interface AuctionBid {
+  round_id: string
+  auction_team_id: string
+  amount: number
+  auto: boolean
+  bid_at: string
+  answer_text: string | null
+  is_correct: boolean | null
+  answered_at: string | null
+  delta: number | null
+  balance_after: number | null
 }
 
 export interface TabooItem {
@@ -252,6 +317,43 @@ export interface PlayerState {
     cipher: { kind: CipherKind; puzzle: string; hint: string | null } | null
     verse: { prompt: string; reference: string | null } | null
   }) | null
+  /** Subasta en curso (o la que terminó en la ronda que se está mostrando). */
+  auction: {
+    id: string
+    status: 'running' | 'finished'
+    rounds_total: number
+    rounds_played: number
+    initial_balance: number
+    teams_total: number
+    teams_bid: number
+    teams_answered: number
+    reference: string | null
+    team: {
+      id: string
+      name: string
+      seq: number
+      balance: number
+      max_bid: number
+      controller_id: string | null
+      controller_name: string | null
+      controller_online: boolean
+      i_control: boolean
+      members: string[]
+      rank: number
+      gain: number
+    } | null
+    /** Solo la apuesta del propio equipo; si acertó se sabe al revelar. */
+    bid: {
+      amount: number
+      auto: boolean
+      answer_text: string | null
+      answered: boolean
+      is_correct: boolean | null
+      delta: number | null
+      balance_after: number | null
+    } | null
+    standings: { name: string; seq: number; balance: number }[]
+  } | null
   my_answer: {
     choice: number | null
     answer_text: string | null

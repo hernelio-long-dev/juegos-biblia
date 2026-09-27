@@ -1,6 +1,6 @@
 # Competencia Bíblica — PWA
 
-App web instalable (PWA) para competencias bíblicas en vivo con cuatro juegos:
+App web instalable (PWA) para competencias bíblicas en vivo con cinco juegos:
 
 1. **Adivina con emojis** — el admin revela pistas (emojis) una por una y los participantes escriben el personaje o historia.
 2. **Selección múltiple** — preguntas con 4 opciones y 20 segundos para responder.
@@ -8,6 +8,8 @@ App web instalable (PWA) para competencias bíblicas en vivo con cuatro juegos:
    palabras prohibidas, y su equipo tiene 45 segundos para adivinarla mientras él la describe.
 4. **Código secreto bíblico** — individual y en dos fases: descifrar un código (números por letras,
    palabras al revés, anagramas, acertijos…) y después confirmarlo buscando el versículo en la Biblia.
+5. **Subasta bíblica** — por equipos de 3 o 4: ven solo la categoría y el nivel, apuestan parte de su saldo
+   y después aparece la pregunta. Conocimiento, conversación en equipo y estrategia.
 
 **Stack:** Vite + React + TypeScript · Tailwind CSS v4 · vite-plugin-pwa · Supabase (Postgres, Auth, Realtime y funciones RPC).
 
@@ -18,7 +20,8 @@ App web instalable (PWA) para competencias bíblicas en vivo con cuatro juegos:
 1. Abre tu proyecto en Supabase → **SQL Editor** → **New query**.
 2. Copia y pega todo el contenido de [`supabase/schema.sql`](supabase/schema.sql) y presiona **Run**.
    Crea las tablas, la seguridad, la lógica del juego y un banco inicial de **36 emojis**, **45 preguntas**,
-   **36 palabras de Tabú** y **36 códigos secretos** (12 de cada nivel: fácil, intermedio, difícil).
+   **36 palabras de Tabú**, **36 códigos secretos** (12 de cada nivel: fácil, intermedio, difícil) y
+   **66 preguntas de subasta** (11 categorías × 3 niveles × 2).
 3. Crea la cuenta del administrador: **Authentication → Users → Add user → Create new user**
    (correo + contraseña, marca **Auto Confirm User**).
 4. Entra a la app en `/admin` con ese correo. **La primera cuenta que inicia sesión queda como administradora**; las demás no tendrán acceso.
@@ -66,9 +69,9 @@ npm run deploy         # compila y sube a https://competencia-biblica.<tu-subdom
 - **Equipos** (botón 🤝, solo para Tabú): eliges cuántos equipos quieres (de 2 a 6; el sistema sugiere uno
   según cuánta gente hay) y el reparto es automático y al azar, en grupos del mismo tamaño (±1).
   Puedes renombrar un equipo, mover a alguien de equipo o volver a repartir.
-- **Bancos de emojis / preguntas / Tabú / códigos:** agrega, edita o elimina contenido.
+- **Bancos de emojis / preguntas / Tabú / códigos / subasta:** agrega, edita o elimina contenido.
 
-Atajos en la consola: `Espacio` siguiente pista/ronda (o iniciar los 45 s en Tabú) · `Enter` ¡adivinaron! (Tabú) ·
+Atajos en la consola: `Espacio` siguiente pista/ronda (o iniciar los 45 s en Tabú, o cerrar las apuestas en la Subasta) · `Enter` ¡adivinaron! (Tabú) ·
 `R` revelar · `T` tabla · `H` ocultar controles · `F` pantalla completa.
 
 ### Participantes (`/`)
@@ -83,6 +86,26 @@ un campo de texto (emojis), 4 botones (selección múltiple) o —en Tabú— su
 4. Cuando está listo, el admin pulsa **▶ Iniciar 45 s**. El resto del equipo responde en voz alta; los demás equipos escuchan.
 5. El admin pulsa **✅ ¡Adivinaron!** (o **⏹️ No adivinaron**). Si se acaban los 45 s, la ronda se cierra sola con 0 puntos.
 6. El turno pasa automáticamente al siguiente equipo.
+
+### Cómo se juega la Subasta bíblica
+1. El admin elige **🔨 Subasta**, cuántas rondas (5 a 12) y pulsa **Formar equipos e iniciar**. El sistema reparte
+   a los que están en la sala en equipos de 3 o 4, lo más parejos posible (10 personas → 4 + 3 + 3), y elige en
+   cada equipo un **celular controlador** (📱) entre los conectados. Cada celular muestra su equipo y sus compañeros.
+   Si ya armaste equipos a mano con 🤝, marca «Usar los equipos actuales».
+2. **▶ Ronda** (o `Espacio`): la pantalla grande muestra solo la **categoría** y la **dificultad**. Por defecto el nivel es
+   «🎲 Mixta» (al azar); también puedes fijarlo. La categoría nunca se repite dos rondas seguidas.
+3. **30 s para apostar.** El equipo conversa y el controlador confirma la apuesta (ya no se puede cambiar).
+   La pantalla dice qué equipos ya apostaron; los montos aparecen solo cuando todos apostaron.
+4. El admin pulsa **🔒 Cerrar apuestas y mostrar pregunta** (`Espacio`). Si se acaba el tiempo se cierra sola, y quien
+   no apostó juega con la mínima. La pregunta aparece a la vez en la pantalla y en todos los celulares.
+5. **40 s para responder.** El controlador escribe **una sola** respuesta. La ronda se cierra sola cuando todos
+   respondieron o se acaba el tiempo (o con **Revelar respuesta**).
+6. Se muestra la respuesta correcta, qué respondió cada equipo, cuánto ganó o perdió y su nuevo saldo.
+7. Tras la última ronda, **🏁 Ver resultado final**. También puedes terminar antes con **🏁 Terminar**.
+
+Mientras hay una subasta en curso no se puede lanzar otro juego ni cambiar a nadie de equipo (sí agregar a
+quien llegó tarde y quedó sin equipo). Si el celular controlador se desconecta, cualquier compañero puede
+pulsar **Tomar el control** en el suyo.
 
 Si alguien cambia de celular, el admin puede **liberar** su nombre desde 👥 (conserva sus puntos).
 
@@ -169,3 +192,26 @@ esas filas, así que siempre puedes auditar ronda por ronda de dónde salió un 
 El histórico **no** depende de que la persona siga dentro de la sala: si la liberas, desaparece de la tabla de
 esa sala pero conserva todo su acumulado. Lo único que borra puntajes es eliminar la sala, el participante o
 la ronda (van en cascada); cerrar una sala no borra nada.
+
+### Subasta bíblica
+- Todos los equipos empiezan con **300** de saldo virtual. Cada ronda apuestan de **20 a 150**
+  (o todo su saldo, si les queda menos de 150).
+- **Aciertan:** ganan lo apostado × el nivel (×1 fácil, ×1.5 intermedio, ×2 difícil).
+  **Fallan o no responden:** pierden lo apostado. El saldo nunca baja de 0, y un equipo sin saldo
+  igual puede apostar 20 para intentar recuperarse.
+
+| Apuesta | Fácil ×1 | Intermedio ×1.5 | Difícil ×2 | Si fallan |
+|---|---|---|---|---|
+| 20 (mínima) | +20 | +30 | +40 | −20 |
+| 50 | +50 | +75 | +100 | −50 |
+| 100 | +100 | +150 | +200 | −100 |
+| 150 (máxima) | +150 | +225 | +300 | −150 |
+
+- **Resultado para el campeonato:** al terminar, lo que el equipo ganó por encima de los 300 iniciales se asigna
+  **igual a cada integrante**, sin importar quién tenía el celular. Terminar con 520 = **+220 puntos** para cada uno;
+  terminar con 300 o menos = 0 (nunca resta puntos de otros juegos). Esos puntos entran a la tabla de la sala y
+  al ranking histórico (filtro 🔨 Subasta bíblica).
+- Con 8 rondas, un equipo muy bueno y arriesgado puede sumar unos 1 000 a 1 500 puntos; uno prudente, unos
+  cientos: la misma escala que los otros juegos.
+- Las apuestas y respuestas nunca viajan a los celulares de otros equipos, y la pregunta no sale del servidor
+  hasta que se cierran las apuestas.

@@ -58,8 +58,8 @@ export default function TeamsDrawer({ roomId, teams, players, onClose, onChanged
           <button className="btn-ghost px-3 py-1" onClick={onClose} aria-label="Cerrar">✕</button>
         </div>
         <p className="text-sm text-indigo-200">
-          Se usan solo en Tabú bíblico. El sistema reparte al azar a los {players.length} que están en la sala,
-          en grupos del mismo tamaño.
+          Se usan en Tabú y en la Subasta bíblica (que también los forma sola, de 3 o 4). El sistema reparte
+          al azar a los {players.length} que están en la sala, en grupos del mismo tamaño.
         </p>
 
         <div className="mt-4 flex items-end gap-2">
@@ -70,9 +70,9 @@ export default function TeamsDrawer({ roomId, teams, players, onClose, onChanged
               type="number"
               className="input w-28 py-2"
               min={2}
-              max={6}
+              max={12}
               value={count}
-              onChange={(e) => setCount(Math.max(2, Math.min(6, Number(e.target.value) || 2)))}
+              onChange={(e) => setCount(Math.max(2, Math.min(12, Number(e.target.value) || 2)))}
             />
           </div>
           <button className="btn-primary flex-1 py-2.5" onClick={assign} disabled={busy || players.length < 2}>
