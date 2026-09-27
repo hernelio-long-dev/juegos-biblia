@@ -1,6 +1,6 @@
 # Competencia Bíblica — PWA
 
-App web instalable (PWA) para competencias bíblicas en vivo con seis juegos:
+App web instalable (PWA) para competencias bíblicas en vivo con siete juegos:
 
 1. **Adivina con emojis** — el admin revela pistas (emojis) una por una y los participantes escriben el personaje o historia.
 2. **Selección múltiple** — preguntas con 4 opciones y 20 segundos para responder.
@@ -12,6 +12,8 @@ App web instalable (PWA) para competencias bíblicas en vivo con seis juegos:
    y después aparece la pregunta. Conocimiento, conversación en equipo y estrategia.
 6. **Línea del tiempo humana** — por equipos de 4 o más: cada integrante recibe en secreto un personaje o
    acontecimiento, y el equipo se pone en fila, físicamente, en orden cronológico. Gana más quien termina primero.
+7. **Escalera bíblica** — individual: 20 niveles cada vez más difíciles, tres salvavidas y checkpoints. El valor
+   se duplica en cada nivel y, después de cada uno, cada quien decide si asegura o sigue arriesgando.
 
 **Stack:** Vite + React + TypeScript · Tailwind CSS v4 · vite-plugin-pwa · Supabase (Postgres, Auth, Realtime y funciones RPC).
 
@@ -23,7 +25,8 @@ App web instalable (PWA) para competencias bíblicas en vivo con seis juegos:
 2. Copia y pega todo el contenido de [`supabase/schema.sql`](supabase/schema.sql) y presiona **Run**.
    Crea las tablas, la seguridad, la lógica del juego y un banco inicial de **36 emojis**, **45 preguntas**,
    **36 palabras de Tabú**, **36 códigos secretos** (12 de cada nivel: fácil, intermedio, difícil) y
-   **66 preguntas de subasta** (11 categorías × 3 niveles × 2) y **24 líneas del tiempo** (8 por nivel).
+   **66 preguntas de subasta** (11 categorías × 3 niveles × 2), **24 líneas del tiempo** (8 por nivel) y
+   **64 desafíos de la Escalera** (16 por tramo).
 3. Crea la cuenta del administrador: **Authentication → Users → Add user → Create new user**
    (correo + contraseña, marca **Auto Confirm User**).
 4. Entra a la app en `/admin` con ese correo. **La primera cuenta que inicia sesión queda como administradora**; las demás no tendrán acceso.
@@ -71,7 +74,7 @@ npm run deploy         # compila y sube a https://competencia-biblica.<tu-subdom
 - **Equipos** (botón 🤝, solo para Tabú): eliges cuántos equipos quieres (de 2 a 6; el sistema sugiere uno
   según cuánta gente hay) y el reparto es automático y al azar, en grupos del mismo tamaño (±1).
   Puedes renombrar un equipo, mover a alguien de equipo o volver a repartir.
-- **Bancos de emojis / preguntas / Tabú / códigos / subasta / líneas del tiempo:** agrega, edita o elimina contenido.
+- **Bancos de emojis / preguntas / Tabú / códigos / subasta / líneas del tiempo / Escalera:** agrega, edita o elimina contenido.
 
 Atajos en la consola: `Espacio` siguiente pista/ronda (o iniciar los 45 s en Tabú, o cerrar las apuestas en la Subasta) · `Enter` ¡adivinaron! (Tabú) ·
 `R` revelar · `T` tabla · `H` ocultar controles · `F` pantalla completa.
@@ -126,6 +129,22 @@ pulsar **Tomar el control** en el suyo.
      hasta 6 errores.
 5. Cuando todos terminan, se acaba el tiempo o el admin pulsa **Revelar respuesta**, aparece el orden correcto
    con una breve explicación bíblica.
+
+### Cómo se juega la Escalera bíblica
+1. El admin elige **🪜 Escalera** y pulsa **Iniciar juego**. Cada quien ve ❤️ ❤️ ❤️ y el botón para comenzar el Nivel 1;
+   desde ahí avanza a su propio ritmo. Quien entra a la sala después se suma solo, con sus tres salvavidas.
+2. Cada desafío tiene tiempo: **20 s** (niveles 1–5), **30 s** (6–10), **45 s** (11–15) y **60 s** (16–20). Se responde
+   una sola vez: escribiendo, eligiendo una opción o marcando libro, capítulo y versículo.
+3. Al superar un nivel su valor se duplica y **decide antes de ver el siguiente reto**:
+   - **🔒 Asegurar y retirarme:** definitivo; conserva todo lo que lleva.
+   - **⬆️ Continuar subiendo:** recién entonces aparece el nuevo desafío.
+4. Si falla (o se acaba el tiempo) y le quedan salvavidas, elige: **gastar uno** y recibir **otro desafío** del mismo
+   nivel, o **terminar**. Sin salvavidas, un fallo lo elimina. Los salvavidas no se recuperan.
+5. **Checkpoints** en los niveles **3, 6, 9, 12, 15 y 18**: quien queda eliminado vuelve al último que superó
+   (sin checkpoint, a 0). Quien se retira conserva todo.
+6. La pantalla grande muestra el nivel, los salvavidas y el estado de cada uno, nunca las respuestas. La Escalera
+   termina sola cuando todos llegaron a la cima, se retiraron o quedaron eliminados; el admin también puede pulsar
+   **🏁 Terminar Escalera** (quien seguía subiendo conserva los niveles que ya superó).
 
 Si alguien cambia de celular, el admin puede **liberar** su nombre desde 👥 (conserva sus puntos).
 
@@ -252,3 +271,17 @@ la ronda (van en cascada); cerrar una sala no borra nada.
 - Los puntos entran a la tabla de la sala, a la tabla **🤝 Equipos** (junto con Tabú) y al ranking histórico.
 - Las tarjetas nunca aparecen en la pantalla grande ni en los celulares de otros equipos; el orden del propio
   equipo solo se muestra cuando lo aciertan.
+
+### Escalera bíblica
+- **Valor interno** (solo para la emoción del juego): 3 al superar el nivel 1 y se duplica en cada nivel:
+  6, 12, 24, 48… hasta **1 572 864** en la cima.
+- Al terminar, el nivel alcanzado se convierte en **puntos del campeonato**: 15 por nivel más un bono que crece
+  **~51 % en cada nivel**, hasta **4 000 puntos en la cima**. Los primeros niveles valen poco y los últimos muchísimo:
+  la cima vale más de 12 veces lo del nivel 12, así que quien va abajo puede remontar si se arriesga.
+
+| Nivel | 1 | 3 🔒 | 5 | 6 🔒 | 9 🔒 | 10 | 12 🔒 | 15 🔒 | 18 🔒 | 20 (cima) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Valor | 3 | 12 | 48 | 96 | 768 | 1 536 | 6 144 | 49 152 | 393 216 | 1 572 864 |
+| Puntos | 17 | 48 | 83 | 102 | 175 | 211 | 318 | 699 | 1 897 | 4 000 |
+
+- Retirarse o llegar a la cima: puntos del nivel alcanzado. Ser eliminado: puntos del último checkpoint 🔒.

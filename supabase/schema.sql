@@ -93,6 +93,29 @@ create table if not exists public.timeline_sets (
   created_at  timestamptz not null default now()
 );
 
+-- Escalera Bíblica: desafíos por tramo (1: niveles 1–5, 2: 6–10, 3: 11–15, 4: 16–20).
+-- answer_type: 'text' (se compara con answer_matches), 'choice' (opciones) o 'reference' (libro, capítulo y versículo).
+create table if not exists public.ladder_challenges (
+  id            uuid primary key default gen_random_uuid(),
+  tier          int  not null check (tier between 1 and 4),
+  kind          text not null,
+  prompt        text not null,
+  hint          text,
+  answer_type   text not null default 'text' check (answer_type in ('text','choice','reference')),
+  answer        text not null,          -- la respuesta tal como se muestra
+  aliases       text[] not null default '{}',
+  options       text[],
+  correct_index int,
+  verse_book    text,
+  verse_chapter int,
+  verse_from    int,
+  verse_to      int,
+  created_at    timestamptz not null default now(),
+  check (answer_type <> 'choice' or (array_length(options, 1) between 2 and 4 and correct_index >= 0
+                                     and correct_index < array_length(options, 1))),
+  check (answer_type <> 'reference' or (verse_book is not null and verse_chapter > 0 and verse_from > 0))
+);
+
 create table if not exists public.rooms (
   id               uuid primary key default gen_random_uuid(),
   name             text not null,
@@ -179,7 +202,7 @@ alter table public.auction_teams replica identity full;
 create table if not exists public.rounds (
   id             uuid primary key default gen_random_uuid(),
   room_id        uuid not null references public.rooms(id) on delete cascade,
-  game           text not null check (game in ('emoji','quiz','taboo','cipher','auction','timeline')),
+  game           text not null check (game in ('emoji','quiz','taboo','cipher','auction','timeline','ladder')),
   difficulty     text not null check (difficulty in ('facil','intermedio','dificil')),
   item_id        uuid not null,
   seq            int  not null,
@@ -216,7 +239,7 @@ do $$ begin
   alter table public.rounds add column if not exists auction_id uuid references public.auctions(id) on delete set null;
   alter table public.rounds add column if not exists category text;
   alter table public.rounds drop constraint if exists rounds_game_check;
-  alter table public.rounds add  constraint rounds_game_check   check (game in ('emoji','quiz','taboo','cipher','auction','timeline'));
+  alter table public.rounds add  constraint rounds_game_check   check (game in ('emoji','quiz','taboo','cipher','auction','timeline','ladder'));
   alter table public.rounds drop constraint if exists rounds_status_check;
   alter table public.rounds add  constraint rounds_status_check check (status in ('pending','active','revealed'));
   if not exists (select 1 from pg_constraint where conname = 'rounds_team_fk') then
@@ -275,6 +298,41 @@ create table if not exists public.auction_bids (
   balance_after   int,
   primary key (round_id, auction_team_id)
 );
+
+-- Escalera Bíblica: una partida por sala; su ronda (game = 'ladder', item_id = ladder)
+-- queda activa mientras dura y concentra los puntos de campeonato.
+create table if not exists public.ladders (
+  id          uuid primary key default gen_random_uuid(),
+  room_id     uuid not null references public.rooms(id) on delete cascade,
+  round_id    uuid references public.rounds(id) on delete set null,
+  status      text not null default 'running' check (status in ('running','finished')),
+  created_at  timestamptz not null default now(),
+  finished_at timestamptz
+);
+create unique index if not exists ladders_one_running on public.ladders(room_id) where status = 'running';
+
+-- Progreso individual. state:
+--   deciding   → superó `passed` niveles (0 = aún no empieza) y elige retirarse o seguir
+--   playing    → tiene un desafío abierto hasta `deadline`
+--   failed     → falló con salvavidas disponibles y elige usar uno o terminar
+--   retired / eliminated / summit → estado final; result_level y points quedan fijos
+create table if not exists public.ladder_players (
+  ladder_id      uuid not null references public.ladders(id) on delete cascade,
+  participant_id uuid not null references public.participants(id) on delete cascade,
+  state          text not null default 'deciding'
+                 check (state in ('deciding','playing','failed','retired','eliminated','summit')),
+  passed         int  not null default 0 check (passed between 0 and 20),
+  lives          int  not null default 3 check (lives between 0 and 3),
+  challenge_id   uuid references public.ladder_challenges(id) on delete set null,
+  deadline       timestamptz,
+  failed_reason  text,
+  seen           uuid[] not null default '{}',
+  result_level   int,
+  points         int,
+  updated_at     timestamptz not null default now(),
+  primary key (ladder_id, participant_id)
+);
+alter table public.ladder_players replica identity full;
 
 -- Línea del Tiempo: la tarjeta secreta de cada participante en la ronda.
 -- `pos` es su lugar en la cronología del set. Solo la lee el admin.
@@ -427,6 +485,31 @@ $$;
 create or replace function public.auction_max_bid(p_balance int) returns int
 language sql immutable as $$ select greatest(20, least(150, p_balance)) $$;
 
+-- ESCALERA BÍBLICA ------------------------------------------------------
+-- Valor interno: 3 al superar el nivel 1 y se duplica en cada nivel (6, 12, 24… 1 572 864 en el 20).
+create or replace function public.ladder_value(p_level int) returns int
+language sql immutable as $$ select case when p_level <= 0 then 0 else (3 * power(2, p_level - 1))::int end $$;
+
+-- Puntos de campeonato: 15 por nivel + un bono que crece ~50,8 % en cada nivel y llega a 3700
+-- en la cima (3700^(nivel/20)), para que llegar alto permita remontar.
+-- Nivel 3 → 48 · 6 → 102 · 9 → 175 · 12 → 318 · 15 → 699 · 18 → 1897 · 20 (cima) → 4000.
+create or replace function public.ladder_points(p_level int) returns int
+language sql immutable as $$
+  select case when p_level <= 0 then 0 else 15 * p_level + round(power(3700::float8, p_level / 20.0))::int end
+$$;
+
+-- Último checkpoint asegurado: niveles 3, 6, 9, 12, 15 y 18.
+create or replace function public.ladder_checkpoint(p_passed int) returns int
+language sql immutable as $$
+  select coalesce(max(c), 0) from unnest(array[3, 6, 9, 12, 15, 18]) c where c <= p_passed
+$$;
+
+-- Segundos por desafío: niveles 1–5 → 20 · 6–10 → 30 · 11–15 → 45 · 16–20 → 60.
+create or replace function public.ladder_seconds(p_level int) returns int
+language sql immutable as $$
+  select case when p_level <= 5 then 20 when p_level <= 10 then 30 when p_level <= 15 then 45 else 60 end
+$$;
+
 -- Línea del Tiempo: según el orden de llegada (1º 100, 2º 80, 3º 65, luego 50),
 -- menos 10 por cada intento fallido (mínimo 30), todo × nivel. Lo gana cada integrante.
 create or replace function public.timeline_points(p_difficulty text, p_place int, p_wrong int) returns int
@@ -477,6 +560,12 @@ begin
   if rd.status = 'revealed' then return true; end if;
   -- Tabú en preparación (aún sin cronómetro): solo el admin puede cerrarla.
   if rd.status = 'pending' and not p_force then return false; end if;
+  -- Escalera: termina cuando el admin la cierra (o solo, cuando todos llegaron a un estado final).
+  if rd.game = 'ladder' and not p_force
+     and exists (select 1 from ladder_players lp
+                  where lp.ladder_id = rd.item_id and lp.state in ('deciding','playing','failed')) then
+    return false;
+  end if;
 
   if not p_force then
     if rd.game = 'cipher' then
@@ -508,6 +597,8 @@ begin
       ) then
         return false;
       end if;
+    elsif rd.game = 'ladder' then
+      null; -- ya se comprobó arriba que nadie sigue jugando
     elsif rd.game = 'auction' then
       -- Se cierra al vencer el tiempo o cuando todos los equipos respondieron.
       if clock_timestamp() < rd.deadline and exists (
@@ -544,6 +635,7 @@ begin
       when 'cipher' then (select ci.answer from cipher_items ci where ci.id = r.item_id)
       when 'auction' then (select aq.answer from auction_questions aq where aq.id = r.item_id)
       when 'timeline' then (select array_to_string(ts.events, ' → ') from timeline_sets ts where ts.id = r.item_id)
+      when 'ladder' then null
       else (select q.options[q.correct_index + 1] from quiz_questions q where q.id = r.item_id) end,
     correct_index = case when r.game = 'quiz'
       then (select q.correct_index from quiz_questions q where q.id = r.item_id) end,
@@ -554,6 +646,9 @@ begin
   -- Si se cerró mientras apostaban, la pregunta nunca se mostró y la ronda queda anulada.
   if found and rd.game = 'auction' and rd.status = 'active' then
     perform settle_auction_round(p_round);
+  end if;
+  if found and rd.game = 'ladder' then
+    perform ladder_close(rd.item_id);
   end if;
   return true;
 end $$;
@@ -587,6 +682,7 @@ begin
   if exists (select 1 from auctions where room_id = p_room and status = 'running') then
     raise exception 'Hay una Subasta Bíblica en curso. Termínala antes de cambiar de juego.';
   end if;
+  perform ladder_guard(p_room);
   for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
     perform reveal_round(v_old, true);
   end loop;
@@ -742,6 +838,7 @@ begin
   if exists (select 1 from auctions where room_id = p_room and status = 'running') then
     raise exception 'Hay una Subasta Bíblica en curso. Termínala antes de cambiar de juego.';
   end if;
+  perform ladder_guard(p_room);
   for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
     perform reveal_round(v_old, true);
   end loop;
@@ -834,6 +931,7 @@ begin
   if exists (select 1 from auctions where room_id = p_room and status = 'running') then
     raise exception 'Ya hay una Subasta Bíblica en curso en esta sala';
   end if;
+  perform ladder_guard(p_room);
   for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
     perform reveal_round(v_old, true);
   end loop;
@@ -966,6 +1064,129 @@ begin
   return json_build_object('ok', true, 'members', v_n);
 end $$;
 
+-- ESCALERA BÍBLICA (admin) ---------------------------------------------
+create or replace function public.ladder_guard(p_room uuid) returns void
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if exists (select 1 from ladders where room_id = p_room and status = 'running') then
+    raise exception 'La Escalera Bíblica está en curso. Termínala antes de cambiar de juego.';
+  end if;
+end $$;
+
+-- Deja fijo el resultado de un participante que llegó a un estado final y le suma
+-- los puntos de campeonato. Solo actúa una vez por persona.
+create or replace function public.ladder_record(p_ladder uuid, p_participant uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare lp ladder_players; lr ladders; v_level int;
+begin
+  select * into lp from ladder_players where ladder_id = p_ladder and participant_id = p_participant;
+  if not found or lp.result_level is not null or lp.state not in ('retired','eliminated','summit') then return; end if;
+  -- Retirarse o llegar a la cima conserva todo; ser eliminado regresa al último checkpoint.
+  v_level := case when lp.state = 'eliminated' then ladder_checkpoint(lp.passed) else lp.passed end;
+  update ladder_players set result_level = v_level, points = ladder_points(v_level), deadline = null,
+                            updated_at = clock_timestamp()
+   where ladder_id = p_ladder and participant_id = p_participant;
+  select * into lr from ladders where id = p_ladder;
+  insert into answers(round_id, room_id, participant_id, is_correct, points, clue_number)
+  values (lr.round_id, lr.room_id, p_participant, v_level > 0, ladder_points(v_level), v_level);
+end $$;
+
+-- Si se venció el tiempo del desafío, cuenta como fallo: con salvavidas elige qué hacer; sin ellos, queda eliminado.
+create or replace function public.ladder_expire(p_ladder uuid, p_participant uuid) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  update ladder_players
+     set state = case when lives > 0 then 'failed' else 'eliminated' end,
+         failed_reason = 'timeout', deadline = null, updated_at = clock_timestamp()
+   where ladder_id = p_ladder and participant_id = p_participant
+     and state = 'playing' and clock_timestamp() > deadline + interval '2 seconds';
+  if found then perform ladder_record(p_ladder, p_participant); end if;
+end $$;
+
+-- Al cerrar: quien seguía en juego conserva los niveles que ya había superado,
+-- como si se hubiera retirado en ese momento (el cierre no es culpa suya).
+create or replace function public.ladder_close(p_ladder uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare v_p uuid;
+begin
+  for v_p in select participant_id from ladder_players where ladder_id = p_ladder loop
+    perform ladder_expire(p_ladder, v_p);
+  end loop;
+  update ladder_players set state = 'retired', deadline = null, updated_at = clock_timestamp()
+   where ladder_id = p_ladder and state in ('deciding','playing','failed');
+  for v_p in select participant_id from ladder_players where ladder_id = p_ladder loop
+    perform ladder_record(p_ladder, v_p);
+  end loop;
+  update ladders set status = 'finished', finished_at = clock_timestamp() where id = p_ladder and status = 'running';
+end $$;
+
+create or replace function public.start_ladder(p_room uuid) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare v_old uuid; v_seq int; v_ladder uuid; v_round uuid;
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  if not exists (select 1 from rooms where id = p_room and status = 'open') then
+    raise exception 'La sala no está abierta';
+  end if;
+  if exists (select 1 from auctions where room_id = p_room and status = 'running') then
+    raise exception 'Hay una Subasta Bíblica en curso. Termínala antes de cambiar de juego.';
+  end if;
+  perform ladder_guard(p_room);
+  if (select count(*) from ladder_challenges) < 20 then
+    raise exception 'El banco de la Escalera tiene muy pocos desafíos';
+  end if;
+  for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
+    perform reveal_round(v_old, true);
+  end loop;
+
+  insert into ladders(room_id) values (p_room) returning id into v_ladder;
+  select coalesce(max(seq), 0) + 1 into v_seq from rounds where room_id = p_room;
+  insert into rounds(room_id, game, difficulty, item_id, seq, status, started_at)
+  values (p_room, 'ladder', 'facil', v_ladder, v_seq, 'active', clock_timestamp())
+  returning id into v_round;
+  update ladders set round_id = v_round where id = v_ladder;
+  -- Todos empiezan igual: nivel 1 y tres salvavidas. Quien entre después se suma solo.
+  insert into ladder_players(ladder_id, participant_id)
+  select v_ladder, participant_id from room_players where room_id = p_room;
+
+  update rooms set current_round_id = v_round, view = 'round' where id = p_room;
+  return v_ladder;
+end $$;
+
+create or replace function public.finish_ladder(p_room uuid) returns boolean
+language plpgsql security definer set search_path = public as $$
+declare v_round uuid;
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  select round_id into v_round from ladders where room_id = p_room and status = 'running';
+  if v_round is null then return false; end if;
+  return reveal_round(v_round, true);
+end $$;
+
+-- Progreso de todos para la pantalla del admin (sin respuestas). De paso vence los desafíos sin contestar.
+create or replace function public.ladder_board(p_room uuid) returns json
+language plpgsql security definer set search_path = public as $$
+declare lr ladders; v_p uuid;
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  select * into lr from ladders where room_id = p_room order by created_at desc limit 1;
+  if not found then return null; end if;
+  if lr.status = 'running' then
+    for v_p in select participant_id from ladder_players where ladder_id = lr.id and state = 'playing' loop
+      perform ladder_expire(lr.id, v_p);
+    end loop;
+  end if;
+  return json_build_object(
+    'id', lr.id, 'status', lr.status, 'round_id', lr.round_id,
+    'players', (select coalesce(json_agg(json_build_object(
+                  'participant_id', lp.participant_id, 'name', p.name, 'state', lp.state,
+                  'passed', lp.passed, 'lives', lp.lives, 'checkpoint', ladder_checkpoint(lp.passed),
+                  'deadline', lp.deadline, 'result_level', lp.result_level, 'points', lp.points)
+                  order by coalesce(lp.result_level, lp.passed) desc, lp.lives desc, p.name), '[]'::json)
+                  from ladder_players lp join participants p on p.id = lp.participant_id
+                 where lp.ladder_id = lr.id));
+end $$;
+
 -- LÍNEA DEL TIEMPO HUMANA ----------------------------------------------
 -- Reparte en privado una tarjeta a cada integrante: cada equipo recibe tantos
 -- acontecimientos del set como personas tiene, elegidos al azar, así dos equipos
@@ -983,6 +1204,7 @@ begin
   if exists (select 1 from auctions where room_id = p_room and status = 'running') then
     raise exception 'Hay una Subasta Bíblica en curso. Termínala antes de cambiar de juego.';
   end if;
+  perform ladder_guard(p_room);
   for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
     perform reveal_round(v_old, true);
   end loop;
@@ -1069,6 +1291,7 @@ declare v_old uuid;
 begin
   if not is_admin() then raise exception 'No autorizado'; end if;
   -- Una subasta sin terminar se liquida para que sus integrantes no pierdan el resultado.
+  -- (La Escalera se cierra sola al revelar su ronda, más abajo.)
   perform finish_auction(p_room);
   for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
     perform reveal_round(v_old, true);
@@ -1217,6 +1440,7 @@ declare
   v_cipher json; v_verse json;
   au auctions; atm auction_teams; b auction_bids; v_auction json;
   v_timeline json; v_tl_team uuid; tr timeline_results;
+  v_ladder json; lp ladder_players; lch ladder_challenges; lr ladders;
 begin
   select * into t from player_tokens where token = p_token;
   if not found then return null; end if;
@@ -1302,6 +1526,29 @@ begin
     end if;
   end if;
 
+  -- Escalera: solo el progreso propio y, mientras juega, su desafío (nunca la respuesta).
+  if rd.id is not null and rd.game = 'ladder' then
+    select * into lr from ladders where id = rd.item_id;
+    if lr.status = 'running' and exists (select 1 from room_players x where x.room_id = t.room_id and x.participant_id = t.participant_id) then
+      insert into ladder_players(ladder_id, participant_id) values (lr.id, t.participant_id) on conflict do nothing;
+      perform ladder_expire(lr.id, t.participant_id);
+    end if;
+    select * into lp from ladder_players where ladder_id = lr.id and participant_id = t.participant_id;
+    if lp.state = 'playing' then select * into lch from ladder_challenges where id = lp.challenge_id; end if;
+    v_ladder := json_build_object(
+      'status', lr.status,
+      'joined', lp.ladder_id is not null,
+      'state', lp.state, 'passed', coalesce(lp.passed, 0), 'lives', coalesce(lp.lives, 3),
+      'failed_reason', lp.failed_reason, 'deadline', lp.deadline,
+      'result_level', lp.result_level, 'points', lp.points,
+      'challenge', case when lch.id is null then null else json_build_object(
+        'kind', lch.kind, 'prompt', lch.prompt, 'hint', lch.hint,
+        'answer_type', lch.answer_type, 'options', lch.options) end,
+      'climbers', (select count(*) from ladder_players x where x.ladder_id = lr.id),
+      'at_top', (select count(*) from ladder_players x where x.ladder_id = lr.id and x.state = 'summit'),
+      'best', (select max(x.passed) from ladder_players x where x.ladder_id = lr.id));
+  end if;
+
   -- Subasta: la que está en curso, o la que terminó en la ronda que se está mostrando.
   select * into au from auctions
    where room_id = t.room_id and (status = 'running' or id = rd.auction_id)
@@ -1368,6 +1615,7 @@ begin
       'auction_id', rd.auction_id, 'category', rd.category) end,
     'auction', v_auction,
     'timeline', v_timeline,
+    'ladder', v_ladder,
     'my_answer', case when a.id is null then null else json_build_object(
       'choice', a.choice, 'answer_text', a.answer_text,
       'is_correct', case when v_show then a.is_correct end,
@@ -1599,6 +1847,99 @@ begin
   return json_build_object('ok', true, 'correct', true, 'place', v_place, 'points', v_pts);
 end $$;
 
+-- ESCALERA — elige un desafío del tramo del nivel que no haya visto esa persona.
+create or replace function public.pick_ladder_challenge(p_level int, p_seen uuid[]) returns uuid
+language sql volatile security definer set search_path = public as $$
+  select id from ladder_challenges
+   where tier = least(4, (p_level + 4) / 5)
+   order by (id = any(p_seen)), random()
+   limit 1;
+$$;
+
+-- ESCALERA — decisiones del jugador:
+--   'next'     → comenzar / continuar subiendo (el desafío se revela recién ahora)
+--   'retire'   → asegurar y retirarse (definitivo; conserva todo)
+--   'lifeline' → tras fallar, gastar un salvavidas: nuevo desafío del mismo nivel
+--   'quit'     → tras fallar, no usar salvavidas: queda eliminado y vuelve al último checkpoint
+create or replace function public.ladder_act(p_token uuid, p_action text) returns json
+language plpgsql security definer set search_path = public as $$
+declare t player_tokens; lr ladders; lp ladder_players; v_level int; v_ch uuid;
+begin
+  select * into t from player_tokens where token = p_token;
+  if not found then raise exception 'Sesión inválida'; end if;
+  select * into lr from ladders where room_id = t.room_id and status = 'running';
+  if not found then return json_build_object('ok', false, 'reason', 'closed'); end if;
+  insert into ladder_players(ladder_id, participant_id) values (lr.id, t.participant_id) on conflict do nothing;
+  perform ladder_expire(lr.id, t.participant_id);
+  select * into lp from ladder_players where ladder_id = lr.id and participant_id = t.participant_id for update;
+
+  if p_action = 'next' and lp.state = 'deciding' and lp.passed < 20
+     or p_action = 'lifeline' and lp.state = 'failed' and lp.lives > 0 then
+    v_level := lp.passed + 1;
+    v_ch := pick_ladder_challenge(v_level, lp.seen);
+    update ladder_players
+       set state = 'playing', challenge_id = v_ch, failed_reason = null,
+           lives = lives - case when p_action = 'lifeline' then 1 else 0 end,
+           deadline = clock_timestamp() + make_interval(secs => ladder_seconds(v_level)),
+           seen = array_append(seen, v_ch), updated_at = clock_timestamp()
+     where ladder_id = lr.id and participant_id = t.participant_id;
+  elsif p_action = 'retire' and lp.state = 'deciding' and lp.passed > 0 then
+    update ladder_players set state = 'retired', updated_at = clock_timestamp()
+     where ladder_id = lr.id and participant_id = t.participant_id;
+    perform ladder_record(lr.id, t.participant_id);
+  elsif p_action = 'quit' and lp.state = 'failed' then
+    update ladder_players set state = 'eliminated', updated_at = clock_timestamp()
+     where ladder_id = lr.id and participant_id = t.participant_id;
+    perform ladder_record(lr.id, t.participant_id);
+  else
+    return json_build_object('ok', false, 'reason', 'invalid');
+  end if;
+  return json_build_object('ok', true);
+end $$;
+
+-- ESCALERA — respuesta al desafío abierto. Un solo intento por desafío.
+create or replace function public.ladder_answer(p_token uuid, p_text text default null, p_choice int default null,
+  p_book text default null, p_chapter int default null, p_verse int default null) returns json
+language plpgsql security definer set search_path = public as $$
+declare t player_tokens; lr ladders; lp ladder_players; ch ladder_challenges; v_ok boolean; v_level int;
+begin
+  select * into t from player_tokens where token = p_token;
+  if not found then raise exception 'Sesión inválida'; end if;
+  select * into lr from ladders where room_id = t.room_id and status = 'running';
+  if not found then return json_build_object('ok', false, 'reason', 'closed'); end if;
+  perform ladder_expire(lr.id, t.participant_id);
+  select * into lp from ladder_players where ladder_id = lr.id and participant_id = t.participant_id for update;
+  if not found or lp.state <> 'playing' then
+    return json_build_object('ok', false, 'reason', case when lp.failed_reason = 'timeout' then 'timeout' else 'invalid' end);
+  end if;
+
+  select * into ch from ladder_challenges where id = lp.challenge_id;
+  v_ok := case ch.answer_type
+    when 'choice' then p_choice is not distinct from ch.correct_index
+    when 'reference' then norm_text(p_book) = norm_text(ch.verse_book) and p_chapter = ch.verse_chapter
+                          and p_verse between ch.verse_from and coalesce(ch.verse_to, ch.verse_from)
+    else answer_matches(left(trim(coalesce(p_text, '')), 80), array_prepend(ch.answer, ch.aliases)) end;
+  v_ok := coalesce(v_ok, false);
+  v_level := lp.passed + 1;
+
+  if v_ok then
+    update ladder_players
+       set passed = v_level, state = case when v_level >= 20 then 'summit' else 'deciding' end,
+           challenge_id = null, deadline = null, updated_at = clock_timestamp()
+     where ladder_id = lr.id and participant_id = t.participant_id;
+    if v_level >= 20 then perform ladder_record(lr.id, t.participant_id); end if;
+    return json_build_object('ok', true, 'correct', true, 'level', v_level,
+                             'checkpoint', v_level = ladder_checkpoint(v_level) and v_level > 0);
+  end if;
+
+  update ladder_players
+     set state = case when lives > 0 then 'failed' else 'eliminated' end,
+         failed_reason = 'wrong', deadline = null, updated_at = clock_timestamp()
+   where ladder_id = lr.id and participant_id = t.participant_id;
+  perform ladder_record(lr.id, t.participant_id);
+  return json_build_object('ok', true, 'correct', false);
+end $$;
+
 -- SUBASTA — equipo del participante en la subasta de esa ronda (null si no tiene).
 create or replace function public.auction_team_of(p_auction uuid, p_participant uuid) returns auction_teams
 language sql stable security definer set search_path = public as $$
@@ -1721,6 +2062,9 @@ alter table public.auction_bids   enable row level security;
 alter table public.timeline_sets  enable row level security;
 alter table public.timeline_cards enable row level security;
 alter table public.timeline_results enable row level security;
+alter table public.ladder_challenges enable row level security;
+alter table public.ladders        enable row level security;
+alter table public.ladder_players enable row level security;
 
 drop policy if exists admins_self on public.admins;
 create policy admins_self on public.admins for select to authenticated using (user_id = auth.uid());
@@ -1777,6 +2121,14 @@ create policy timeline_cards_admin on public.timeline_cards for all to authentic
 drop policy if exists timeline_results_admin on public.timeline_results;
 create policy timeline_results_admin on public.timeline_results for all to authenticated using (is_admin()) with check (is_admin());
 
+-- Escalera: el banco y el progreso solo por funciones o el admin.
+drop policy if exists ladder_challenges_admin on public.ladder_challenges;
+create policy ladder_challenges_admin on public.ladder_challenges for all to authenticated using (is_admin()) with check (is_admin());
+drop policy if exists ladders_admin on public.ladders;
+create policy ladders_admin on public.ladders for all to authenticated using (is_admin()) with check (is_admin());
+drop policy if exists ladder_players_admin on public.ladder_players;
+create policy ladder_players_admin on public.ladder_players for all to authenticated using (is_admin()) with check (is_admin());
+
 drop policy if exists rooms_read on public.rooms;
 create policy rooms_read on public.rooms for select to anon, authenticated using (true);
 drop policy if exists rooms_admin on public.rooms;
@@ -1808,7 +2160,8 @@ grant select, insert, update, delete on
   public.room_codes, public.room_players, public.rounds, public.answers,
   public.teams, public.team_members,
   public.auction_questions, public.auctions, public.auction_teams, public.auction_bids,
-  public.timeline_sets, public.timeline_cards, public.timeline_results to authenticated;
+  public.timeline_sets, public.timeline_cards, public.timeline_results,
+  public.ladder_challenges, public.ladders, public.ladder_players to authenticated;
 grant select on public.admins to authenticated;
 revoke all on public.player_tokens from anon, authenticated;
 
@@ -1820,7 +2173,11 @@ revoke execute on function public.create_room(text), public.reveal_round(uuid, b
   public.stop_taboo(uuid, boolean),
   public.start_auction(uuid, int, boolean), public.start_auction_round(uuid, text),
   public.close_auction_bids(uuid, boolean), public.finish_auction(uuid),
-  public.start_timeline_round(uuid, text) from anon, public;
+  public.start_timeline_round(uuid, text),
+  public.start_ladder(uuid), public.finish_ladder(uuid), public.ladder_board(uuid) from anon, public;
+-- Internas de la Escalera: solo se llaman desde otras funciones.
+revoke execute on function public.ladder_record(uuid, uuid), public.ladder_expire(uuid, uuid),
+  public.ladder_close(uuid), public.pick_ladder_challenge(int, uuid[]) from anon, authenticated, public;
 -- Internas: solo se llaman desde otras funciones.
 revoke execute on function public.settle_auction_round(uuid), public.pick_auction_controller(uuid, uuid)
   from anon, authenticated, public;
@@ -1832,7 +2189,8 @@ grant execute on function public.create_room(text), public.reveal_round(uuid, bo
   public.stop_taboo(uuid, boolean),
   public.start_auction(uuid, int, boolean), public.start_auction_round(uuid, text),
   public.close_auction_bids(uuid, boolean), public.finish_auction(uuid),
-  public.start_timeline_round(uuid, text) to authenticated;
+  public.start_timeline_round(uuid, text),
+  public.start_ladder(uuid), public.finish_ladder(uuid), public.ladder_board(uuid) to authenticated;
 grant execute on function public.server_now(), public.room_scoreboard(uuid, text), public.lookup_room(text),
   public.join_room(text, uuid), public.player_state(uuid), public.submit_emoji(uuid, uuid, text),
   public.submit_quiz(uuid, uuid, int), public.is_admin(),
@@ -1840,7 +2198,8 @@ grant execute on function public.server_now(), public.room_scoreboard(uuid, text
   public.room_team_scoreboard(uuid), public.room_teams(uuid),
   public.global_scoreboard(text),
   public.submit_auction_bid(uuid, uuid, int), public.submit_auction_answer(uuid, uuid, text),
-  public.claim_auction_control(uuid), public.submit_timeline(uuid, uuid, uuid[]) to anon, authenticated;
+  public.claim_auction_control(uuid), public.submit_timeline(uuid, uuid, uuid[]),
+  public.ladder_act(uuid, text), public.ladder_answer(uuid, text, int, text, int, int) to anon, authenticated;
 
 -- ---------------------------------------------------------------------
 -- REALTIME
@@ -1849,7 +2208,8 @@ do $$
 declare tbl text;
 begin
   foreach tbl in array array['rooms','rounds','room_players','answers','teams','team_members',
-                           'auctions','auction_teams','auction_bids','timeline_results'] loop
+                           'auctions','auction_teams','auction_bids','timeline_results',
+                           'ladder_players'] loop
     if not exists (select 1 from pg_publication_tables
                     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = tbl) then
       execute format('alter publication supabase_realtime add table public.%I', tbl);
@@ -2244,5 +2604,75 @@ insert into public.timeline_sets (difficulty, title, events, explanation) values
 ('dificil','Abraham y su descendencia',
  array['Dios llama a Abraham','Abraham y Lot se separan','Destrucción de Sodoma','Nace Isaac','Abraham ofrece a Isaac en Moriah','Jacob recibe la bendición de Isaac'],
  'Génesis 12, 13, 19, 21, 22 y 27.');
+end if;
+end $$;
+
+do $$ begin
+if not exists (select 1 from public.ladder_challenges) then
+insert into public.ladder_challenges (tier, kind, prompt, hint, answer_type, answer, aliases, options, correct_index, verse_book, verse_chapter, verse_from, verse_to) values
+(1,'Palabra desordenada','Ordena las letras: S O I M S E','Un personaje del Éxodo.','text','Moisés','{"moises"}',null,null,null,null,null,null),
+(1,'Palabra desordenada','Ordena las letras: V I D A D','Venció a un gigante.','text','David','{}',null,null,null,null,null,null),
+(1,'Completa la frase','«En el principio creó Dios los ____ y la tierra.»','Génesis 1:1','text','cielos','{"los cielos"}',null,null,null,null,null,null),
+(1,'Completa la frase','«Jehová es mi pastor; nada me ____.»','Salmo 23:1','text','faltará','{"faltara"}',null,null,null,null,null,null),
+(1,'Completa la frase','«Porque de tal manera amó Dios al ____, que ha dado a su Hijo unigénito…»','Juan 3:16','text','mundo','{"el mundo"}',null,null,null,null,null,null),
+(1,'Personaje','¿Quién derribó las columnas del templo de los filisteos?',null,'choice','Sansón','{}','{"Goliat","Sansón","David","Gedeón"}',1,null,null,null,null),
+(1,'Código','Descifra: 14 - 15 - 5','A = 1, B = 2, C = 3…','text','Noé','{"noe"}',null,null,null,null,null,null),
+(1,'Acertijo','«Tuve una túnica de colores y mis hermanos me vendieron.» ¿Quién soy?',null,'text','José','{"jose"}',null,null,null,null,null,null),
+(1,'Acertijo','«Fui la primera mujer.» ¿Quién soy?',null,'text','Eva','{}',null,null,null,null,null,null),
+(1,'Pregunta','¿Cuántos discípulos escogió Jesús?',null,'choice','12','{}','{"7","10","12","70"}',2,null,null,null,null),
+(1,'Código','Léelo al revés: S A N O J','Un profeta y un gran pez.','text','Jonás','{"jonas"}',null,null,null,null,null,null),
+(1,'Completa la frase','«Lámpara es a mis pies tu ____, y lumbrera a mi camino.»','Salmo 119:105','text','palabra','{"tu palabra"}',null,null,null,null,null,null),
+(1,'Pregunta','¿Qué animal habló con Eva en el huerto?',null,'choice','La serpiente','{}','{"El león","La serpiente","El burro","La paloma"}',1,null,null,null,null),
+(1,'Acertijo','«Derroté a un gigante con una honda y una piedra.» ¿Quién soy?',null,'text','David','{}',null,null,null,null,null,null),
+(1,'Palabra desordenada','Ordena las letras: L E N B E','Una ciudad pequeña de Judá.','text','Belén','{"belen"}',null,null,null,null,null,null),
+(1,'Pregunta','¿Qué usó Jesús para alimentar a los cinco mil?',null,'choice','Cinco panes y dos peces','{}','{"Siete panes","Cinco panes y dos peces","Maná del cielo","Un cordero"}',1,null,null,null,null),
+(2,'referencia','¿Dónde dice «Porque de tal manera amó Dios al mundo, que ha dado a su Hijo unigénito»?',null,'reference','Juan 3:16','{}',null,null,'Juan',3,16,null),
+(2,'referencia','¿Dónde dice «Jehová es mi pastor; nada me faltará»?',null,'reference','Salmos 23:1','{}',null,null,'Salmos',23,1,null),
+(2,'Ordenar','¿Cuál es el orden correcto, del más antiguo al más reciente?',null,'choice','Abraham → Moisés → David','{}','{"Moisés → Abraham → David","Abraham → Moisés → David","Abraham → David → Moisés","David → Abraham → Moisés"}',1,null,null,null,null),
+(2,'Ordenar','¿Cuál es el orden de los primeros libros de la Biblia?',null,'choice','Génesis → Éxodo → Levítico → Números','{}','{"Génesis → Levítico → Éxodo → Números","Éxodo → Génesis → Números → Levítico","Génesis → Éxodo → Levítico → Números","Génesis → Números → Éxodo → Levítico"}',2,null,null,null,null),
+(2,'Código','Descifra: K P T V F','Cada letra está una posición adelante en el alfabeto. Retrocede una.','text','Josué','{"josue"}',null,null,null,null,null,null),
+(2,'Código','Descifra: 19 - 1 - 12 - 15 - 13 - 15 - 14','A = 1, B = 2, C = 3…','text','Salomón','{"salomon"}',null,null,null,null,null,null),
+(2,'Personaje','«Fui juez de Israel y vencí a los madianitas con solo 300 hombres.» ¿Quién soy?',null,'text','Gedeón','{"gedeon"}',null,null,null,null,null,null),
+(2,'Acertijo','«No me incliné ante la estatua y salí vivo del horno de fuego con dos amigos. Mi nombre babilonio empieza con S.» ¿Quién soy?',null,'text','Sadrac','{}',null,null,null,null,null,null),
+(2,'Pregunta','¿Qué profeta fue alimentado por cuervos?',null,'choice','Elías','{}','{"Eliseo","Jonás","Elías","Samuel"}',2,null,null,null,null),
+(2,'Completa la frase','«Todo lo puedo en Cristo que me ____.»','Filipenses 4:13','text','fortalece','{}',null,null,null,null,null,null),
+(2,'referencia','¿Dónde dice «Todo lo puedo en Cristo que me fortalece»?',null,'reference','Filipenses 4:13','{}',null,null,'Filipenses',4,13,null),
+(2,'Ordenar','¿Cuál es el orden correcto en la vida de Jesús?',null,'choice','Bautismo → Tentación en el desierto → Transfiguración','{}','{"Tentación en el desierto → Bautismo → Transfiguración","Bautismo → Transfiguración → Tentación en el desierto","Bautismo → Tentación en el desierto → Transfiguración","Transfiguración → Bautismo → Tentación en el desierto"}',2,null,null,null,null),
+(2,'Código','Completa las vocales: N _ H _ M _ _ S','Un libro del Antiguo Testamento.','text','Nehemías','{"nehemias"}',null,null,null,null,null,null),
+(2,'Personaje','¿Qué discípulo caminó sobre el agua hacia Jesús?',null,'text','Pedro','{"simon pedro"}',null,null,null,null,null,null),
+(2,'Personaje','¿Cómo se llamaba la esposa de Isaac?',null,'text','Rebeca','{}',null,null,null,null,null,null),
+(2,'Personaje','¿Qué rey de Babilonia vio una mano escribir en la pared?',null,'text','Belsasar','{"baltasar"}',null,null,null,null,null,null),
+(3,'referencia','Busca en tu Biblia: «Mira que te mando que te esfuerces y seas valiente».',null,'reference','Josué 1:9','{}',null,null,'Josué',1,9,null),
+(3,'referencia','Busca en tu Biblia: «Clama a mí, y yo te responderé, y te enseñaré cosas grandes y ocultas».',null,'reference','Jeremías 33:3','{}',null,null,'Jeremías',33,3,null),
+(3,'referencia','Busca en tu Biblia: «Fíate de Jehová de todo tu corazón, y no te apoyes en tu propia prudencia».',null,'reference','Proverbios 3:5','{}',null,null,'Proverbios',3,5,null),
+(3,'referencia','Busca en tu Biblia: «Venid a mí todos los que estáis trabajados y cargados, y yo os haré descansar».',null,'reference','Mateo 11:28','{}',null,null,'Mateo',11,28,null),
+(3,'referencia','Busca en tu Biblia: «Yo soy el camino, y la verdad, y la vida».',null,'reference','Juan 14:6','{}',null,null,'Juan',14,6,null),
+(3,'referencia','Busca en tu Biblia: «Acuérdate de tu Creador en los días de tu juventud».',null,'reference','Eclesiastés 12:1','{}',null,null,'Eclesiastés',12,1,null),
+(3,'referencia','Busca en tu Biblia: «El amor es sufrido, es benigno; el amor no tiene envidia».',null,'reference','1 Corintios 13:4','{}',null,null,'1 Corintios',13,4,null),
+(3,'referencia','Busca en tu Biblia: «Es, pues, la fe la certeza de lo que se espera, la convicción de lo que no se ve».',null,'reference','Hebreos 11:1','{}',null,null,'Hebreos',11,1,null),
+(3,'Pregunta','¿Cuántos años reinó David sobre Israel?','1 Reyes 2:11','text','40','{"cuarenta","40 años"}',null,null,null,null,null,null),
+(3,'Personaje','¿Qué rey de Persia dio el decreto para reconstruir el templo de Jerusalén?',null,'text','Ciro','{"rey ciro"}',null,null,null,null,null,null),
+(3,'Personaje','¿Cómo se llamaba la madre del profeta Samuel?',null,'text','Ana','{}',null,null,null,null,null,null),
+(3,'Lugar','¿En qué isla naufragó Pablo camino a Roma?',null,'text','Malta','{}',null,null,null,null,null,null),
+(3,'Pregunta','¿De qué tribu eran los sacerdotes y levitas?',null,'choice','Leví','{}','{"Judá","Leví","Rubén","Benjamín"}',1,null,null,null,null),
+(3,'Personaje','¿Qué profeta confrontó a David por su pecado con Betsabé?',null,'text','Natán','{"natan"}',null,null,null,null,null,null),
+(3,'Personaje','¿Cómo se llamaba el primer hijo de Adán y Eva?',null,'text','Caín','{"cain"}',null,null,null,null,null,null),
+(3,'Ordenar','¿En qué orden aparecen estos libros en la Biblia?',null,'choice','Isaías → Jeremías → Ezequiel → Daniel','{}','{"Jeremías → Isaías → Daniel → Ezequiel","Isaías → Jeremías → Ezequiel → Daniel","Isaías → Ezequiel → Jeremías → Daniel","Daniel → Isaías → Jeremías → Ezequiel"}',1,null,null,null,null),
+(4,'Varios pasos','Descifra 1 - 2 - 9 - 7 - 1 - 9 - 12 (A = 1) para saber de qué mujer se trata. ¿En qué libro está su historia?',null,'choice','1 Samuel','{}','{"1 Samuel","2 Samuel","Rut","Jueces"}',0,null,null,null,null),
+(4,'Varios pasos','Soy el profeta que ungió a los dos primeros reyes de Israel. ¿Cómo se llamaba mi madre?',null,'text','Ana','{}',null,null,null,null,null,null),
+(4,'Varios pasos','La moabita que fue bisabuela del rey David tenía una suegra. ¿Cómo se llamaba la suegra?',null,'text','Noemí','{"noemi"}',null,null,null,null,null,null),
+(4,'Varios pasos','El hombre que subió a un árbol sicómoro para ver a Jesús, ¿qué oficio tenía?',null,'text','Jefe de los publicanos','{"publicano","cobrador de impuestos","recaudador de impuestos","jefe de publicanos"}',null,null,null,null,null,null),
+(4,'referencia','El discípulo amado escribió en una carta: «El que no ama, no ha conocido a Dios; porque Dios es amor». Encuentra el versículo.',null,'reference','1 Juan 4:8','{}',null,null,'1 Juan',4,8,null),
+(4,'referencia','«Instruye al niño en su camino, y aun cuando fuere viejo no se apartará de él.» Encuentra el versículo.',null,'reference','Proverbios 22:6','{}',null,null,'Proverbios',22,6,null),
+(4,'referencia','Jesús le dijo a Marta: «Yo soy la resurrección y la vida». Encuentra el versículo.',null,'reference','Juan 11:25','{}',null,null,'Juan',11,25,null),
+(4,'referencia','«Porque la paga del pecado es muerte, mas la dádiva de Dios es vida eterna.» Encuentra el versículo.',null,'reference','Romanos 6:23','{}',null,null,'Romanos',6,23,null),
+(4,'Personaje','El padre de Juan el Bautista quedó mudo hasta que nació su hijo. ¿Cómo se llamaba?',null,'text','Zacarías','{"zacarias"}',null,null,null,null,null,null),
+(4,'Varios pasos','El joven que cuidaba la ropa de quienes apedrearon a Esteban es más conocido con otro nombre. ¿Cuál?',null,'text','Pablo','{"apostol pablo","pablo de tarso"}',null,null,null,null,null,null),
+(4,'Personaje','¿Cómo se llamaba el hijo de Jonatán, lisiado de los pies, que comía a la mesa del rey David?',null,'text','Mefiboset','{"meribaal"}',null,null,null,null,null,null),
+(4,'Ordenar','¿Cuál es el orden correcto de estos jueces?',null,'choice','Otoniel → Débora → Gedeón → Sansón','{}','{"Débora → Otoniel → Sansón → Gedeón","Otoniel → Gedeón → Débora → Sansón","Otoniel → Débora → Gedeón → Sansón","Gedeón → Otoniel → Débora → Sansón"}',2,null,null,null,null),
+(4,'Personaje','¿Qué rey de Judá comenzó a reinar a los siete años, protegido por el sacerdote Joiada?',null,'text','Joás','{"joas"}',null,null,null,null,null,null),
+(4,'Lugar','¿A qué tierra llevó Abraham a Isaac para ofrecerlo en sacrificio?',null,'text','Moriah','{"moria"}',null,null,null,null,null,null),
+(4,'Varios pasos','Descifra F M J B T (cada letra está una posición adelante en el alfabeto). ¿Quién fue el sucesor de ese profeta?',null,'text','Eliseo','{}',null,null,null,null,null,null),
+(4,'Pregunta','¿Cuántos años tenía Abraham cuando nació Isaac?',null,'choice','100','{}','{"75","90","100","120"}',2,null,null,null,null);
 end if;
 end $$;

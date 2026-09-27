@@ -17,6 +17,7 @@ import {
 import TeamsDrawer, { suggestedTeams } from './TeamsDrawer'
 import { AuctionLauncher, AuctionRoundStage, AuctionTeamsStage, useAuction } from './AuctionStage'
 import { TimelineStage, useTimeline } from './TimelineStage'
+import { LadderStage, useLadder } from './LadderStage'
 
 type Remaining = Record<Game, Record<Difficulty, number>>
 type BoardView = Game | 'teams' | null
@@ -98,19 +99,22 @@ export default function RoomConsole() {
   }, [roomId])
 
   const loadRemaining = useCallback(async () => {
-    const [{ data: e }, { data: q }, { data: tb }, { data: ci }, { data: au }, { data: tl }, { data: used }] = await Promise.all([
+    const [{ data: e }, { data: q }, { data: tb }, { data: ci }, { data: au }, { data: tl }, { count: ld }, { data: used }] = await Promise.all([
       supabase.from('emoji_items').select('id, difficulty'),
       supabase.from('quiz_questions').select('id, difficulty'),
       supabase.from('taboo_items').select('id, difficulty'),
       supabase.from('cipher_items').select('id, difficulty'),
       supabase.from('auction_questions').select('id, difficulty'),
       supabase.from('timeline_sets').select('id, difficulty'),
+      supabase.from('ladder_challenges').select('id', { count: 'exact', head: true }),
       supabase.from('rounds').select('item_id').eq('room_id', roomId),
     ])
     const usedSet = new Set((used ?? []).map((u) => u.item_id))
     const count = (rows: { id: string; difficulty: Difficulty }[] | null) =>
       Object.fromEntries(DIFFICULTIES.map((d) => [d, (rows ?? []).filter((x) => x.difficulty === d && !usedSet.has(x.id)).length])) as Record<Difficulty, number>
-    setRemaining({ emoji: count(e), quiz: count(q), taboo: count(tb), cipher: count(ci), auction: count(au), timeline: count(tl) })
+    setRemaining({ emoji: count(e), quiz: count(q), taboo: count(tb), cipher: count(ci), auction: count(au), timeline: count(tl),
+      // La Escalera no se elige por nivel: todos los desafíos cuentan.
+      ladder: Object.fromEntries(DIFFICULTIES.map((d) => [d, ld ?? 0])) as Record<Difficulty, number> })
   }, [roomId])
 
   const roundId = round?.id ?? null
@@ -169,6 +173,17 @@ export default function RoomConsole() {
 
   const auction = useAuction(roomId, round, now, run, loadRoom)
   const timeline = useTimeline(round, now, loadRoom)
+  const ladder = useLadder(roomId, round, loadRoom)
+  const ladderRunning = round?.game === 'ladder' && round.status === 'active'
+
+  const finishLadder = useCallback(async () => {
+    const left = ladder?.players.filter((p) => ['deciding', 'playing', 'failed'].includes(p.state)).length ?? 0
+    const msg = left > 0
+      ? `${left} siguen subiendo. Si terminas ahora, cada uno conserva los niveles que ya superó. ¿Terminar la Escalera?`
+      : '¿Terminar la Escalera y mostrar el resultado?'
+    if (!confirm(msg)) return
+    await run(() => supabase.rpc('finish_ladder', { p_room: roomId }))
+  }, [ladder, run, roomId])
 
   // Línea del Tiempo: equipos de 4 o más con todos los que están en la sala.
   const formTimelineTeams = useCallback(async () => {
@@ -186,6 +201,8 @@ export default function RoomConsole() {
     setDifficulty(d)
     if (g === 'auction') {
       await auction.next(auctionMix ? null : d)
+    } else if (g === 'ladder') {
+      await run(() => supabase.rpc('start_ladder', { p_room: roomId }))
     } else if (g === 'timeline') {
       await run(() => supabase.rpc('start_timeline_round', { p_room: roomId, p_difficulty: d }))
       loadTeams() // si la sala no tenía equipos, el servidor los acaba de formar
@@ -214,7 +231,8 @@ export default function RoomConsole() {
   }, [round, run])
 
   const reveal = useCallback(() => {
-    if (round?.status === 'active') run(() => supabase.rpc('reveal_round', { p_round: round.id, p_force: true }))
+    // La Escalera solo se termina con su botón (pide confirmación).
+    if (round?.status === 'active' && round.game !== 'ladder') run(() => supabase.rpc('reveal_round', { p_round: round.id, p_force: true }))
   }, [round, run])
 
   const nextClue = useCallback(() => {
@@ -247,7 +265,7 @@ export default function RoomConsole() {
   const autoRevealed = useRef<string | null>(null)
   useEffect(() => {
     if (!round || round.status !== 'active' || autoRevealed.current === round.id) return
-    if (round.game === 'auction' || round.game === 'timeline') return // lo manejan useAuction y useTimeline
+    if (round.game === 'auction' || round.game === 'timeline' || round.game === 'ladder') return // tienen su propio hook
     if (now < new Date(round.started_at).getTime()) return
     const correctCount = roundAnswers.filter((a) => a.is_correct).length
 
@@ -310,6 +328,7 @@ export default function RoomConsole() {
         if (round?.status === 'active' && round.game === 'emoji') nextClue()
         else if (round?.game === 'taboo' && round.status === 'pending') startTaboo()
         else if (round?.game === 'auction' && round.status === 'pending') auction.closeBids()
+        else if (round?.game === 'ladder' && round.status === 'active') return
         else if (room?.view !== 'podium') startRound()
       }
     }
@@ -367,6 +386,7 @@ export default function RoomConsole() {
         {view === 'round' && round && round.game === 'cipher' && (
           <CipherStage round={round} item={cipherItem} peek={peek} answers={roundAnswers} players={players} now={now} />
         )}
+        {view === 'round' && round?.game === 'ladder' && <LadderStage board={ladder} round={round} />}
         {view === 'round' && round?.game === 'timeline' && (
           <TimelineStage data={timeline} round={round} teams={teams} peek={peek} now={now} />
         )}
@@ -442,7 +462,10 @@ export default function RoomConsole() {
                     {peek ? '🙈 Ocultar respuesta' : '👁️ Ver respuesta'}
                   </button>
                 )}
-                {view === 'round' && round?.status === 'active' && round.game !== 'taboo' && (
+                {view === 'round' && ladderRunning && (
+                  <button className="btn-primary px-6 text-lg" onClick={finishLadder} disabled={busy}>🏁 Terminar Escalera</button>
+                )}
+                {view === 'round' && round?.status === 'active' && round.game !== 'taboo' && round.game !== 'ladder' && (
                   <button className="btn-secondary" onClick={reveal} disabled={busy}>👁️ Revelar respuesta</button>
                 )}
 
@@ -455,7 +478,9 @@ export default function RoomConsole() {
                     </button>
                   ))}
                   <span className="mx-1 h-6 w-px bg-white/15" />
-                  {game === 'auction' ? (
+                  {game === 'ladder' ? (
+                    <span className="px-2 text-sm text-indigo-200">20 niveles · ❤️❤️❤️ · cada quien a su ritmo</span>
+                  ) : game === 'auction' ? (
                     <AuctionLauncher
                       data={auction} round={round} difficulty={difficulty} setDifficulty={setDifficulty}
                       mix={auctionMix} setMix={setAuctionMix} remaining={remaining?.auction ?? null}
@@ -491,8 +516,8 @@ export default function RoomConsole() {
                     <button
                       className={`${round?.status === 'active' ? 'btn-secondary' : 'btn-primary'} px-5 py-2`}
                       onClick={() => startRound()}
-                      disabled={busy || !remaining || remaining[game][difficulty] === 0 || (game === 'taboo' && !teamId) || !!auction.running}
-                      title={auction.running ? 'Termina la subasta para cambiar de juego' : 'Espacio'}
+                      disabled={busy || !remaining || remaining[game][difficulty] === 0 || (game === 'taboo' && !teamId) || !!auction.running || ladderRunning}
+                      title={auction.running ? 'Termina la subasta para cambiar de juego' : ladderRunning ? 'Termina la Escalera para cambiar de juego' : 'Espacio'}
                     >
                       ▶ {view === 'round' && round ? 'Siguiente ronda' : 'Iniciar juego'}
                     </button>

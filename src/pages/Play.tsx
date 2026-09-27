@@ -5,11 +5,12 @@ import { secondsLeft, useClockSync, useServerNow } from '../lib/clock'
 import { celebrate, vibrate } from '../lib/fx'
 import { clearPlayerSession, getPlayerSession } from '../lib/player'
 import { useLiveRefresh } from '../lib/realtime'
-import { auctionGain, emojiPoints } from '../lib/scoring'
+import { auctionGain, emojiPoints, ladderCheckpoint, ladderPoints, ladderSeconds, ladderValue } from '../lib/scoring'
 import { errorMessage, playerClient, requestTimeout } from '../lib/supabase'
 import {
   AUCTION_ANSWER_SECONDS, AUCTION_BID_SECONDS, AUCTION_MIN_BID, BIBLE_BOOKS, CIPHER_KIND_LABEL, CIPHER_SECONDS,
   DIFFICULTY_LABEL, DIFFICULTY_MULTIPLIER, EMOJI_FINAL_SECONDS, GAME_LABEL, OPTION_STYLES,
+  LADDER_CHECKPOINTS, LADDER_LEVELS, LADDER_LIVES,
   QUIZ_SECONDS, TABOO_SECONDS, TIMELINE_MAX_WRONG, TIMELINE_SECONDS, VERSE_SECONDS, teamStyle,
   type PlayerState,
 } from '../lib/types'
@@ -123,7 +124,9 @@ export default function Play() {
         ) : auctionTeams ? (
           <AuctionTeamCard state={state} token={token} refresh={refresh} />
         ) : room.view === 'round' && round ? (
-          round.game === 'timeline'
+          round.game === 'ladder'
+            ? <LadderPlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
+            : round.game === 'timeline'
             ? <TimelinePlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
             : round.game === 'auction'
             ? <AuctionPlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
@@ -798,6 +801,294 @@ function TabooPlay({ state, round, now }: { state: PlayerState; round: Round; no
         <p className="mt-6 text-sm text-indigo-300">Tú juegas con <b>{state.me.team.name}</b>.</p>
       )}
     </InfoCard>
+  )
+}
+
+// ---------------------------------------------------------------- ESCALERA BÍBLICA
+type LadderInfo = NonNullable<PlayerState['ladder']>
+
+const fmt = (n: number) => n.toLocaleString('es')
+
+function Hearts({ lives, big = false }: { lives: number; big?: boolean }) {
+  return (
+    <span className={big ? 'text-4xl tracking-widest' : 'text-lg'} aria-label={`${lives} salvavidas`}>
+      {Array.from({ length: LADDER_LIVES }, (_, i) => (i < lives ? '❤️' : '🖤')).join(' ')}
+    </span>
+  )
+}
+
+/** Los 20 peldaños, con los checkpoints y el nivel actual. */
+function Rungs({ passed }: { passed: number }) {
+  return (
+    <div className="flex gap-0.5" aria-label={`Nivel ${passed} de ${LADDER_LEVELS}`}>
+      {Array.from({ length: LADDER_LEVELS }, (_, i) => {
+        const lvl = i + 1
+        const cp = LADDER_CHECKPOINTS.includes(lvl)
+        return (
+          <span key={lvl} title={`Nivel ${lvl}`}
+            className={`h-3 flex-1 rounded-sm ${lvl <= passed ? (cp ? 'bg-emerald-400' : 'bg-amber-400') : lvl === passed + 1 ? 'bg-white/40' : 'bg-white/10'}
+              ${cp ? 'ring-1 ring-emerald-300/70' : ''}`} />
+        )
+      })}
+    </div>
+  )
+}
+
+function LadderHeader({ ladder, level, extra }: { ladder: LadderInfo; level: number; extra?: ReactNode }) {
+  return (
+    <div className="mb-4">
+      <div className="flex items-center gap-3">
+        <div>
+          <p className="text-xs uppercase tracking-wider text-indigo-300">🪜 Escalera bíblica</p>
+          <p className="font-display text-2xl font-bold">Nivel {level} <span className="text-indigo-300">de {LADDER_LEVELS}</span></p>
+        </div>
+        <div className="ml-auto text-right">
+          <Hearts lives={ladder.lives} />
+          <p className="font-display text-lg font-bold tabular-nums text-amber-300">💰 {fmt(ladderValue(ladder.passed))}</p>
+        </div>
+        {extra}
+      </div>
+      <div className="mt-3"><Rungs passed={ladder.passed} /></div>
+    </div>
+  )
+}
+
+function LadderPlay({ state, token, now, refresh }: PlayProps) {
+  const ladder = state.ladder
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const left = secondsLeft(ladder?.deadline ?? null, now)
+
+  // Al vencerse el tiempo, el servidor lo marca como fallo en la siguiente consulta.
+  const expired = ladder?.state === 'playing' && left === 0
+  useEffect(() => {
+    if (!expired) return
+    const id = setTimeout(refresh, 2500)
+    return () => clearTimeout(id)
+  }, [expired, refresh])
+  const final = ladder?.state === 'summit'
+  useEffect(() => { if (final) celebrate(true) }, [final])
+
+  async function act(action: 'next' | 'retire' | 'lifeline' | 'quit') {
+    if (busy) return
+    setBusy(true)
+    setError('')
+    const { data, error } = await playerClient.rpc('ladder_act', { p_token: token, p_action: action })
+    setBusy(false)
+    if (error) setError(errorMessage(error))
+    else if (!data.ok) setError(data.reason === 'closed' ? 'La Escalera ya terminó.' : 'Esa opción ya no está disponible.')
+    else vibrate(40)
+    refresh()
+  }
+
+  if (!ladder || !ladder.joined || !ladder.state) {
+    return <InfoCard emoji="🪜" title="Escalera bíblica" text="Espera un momento: te estamos sumando a la Escalera." />
+  }
+
+  const { passed, lives } = ladder
+  const level = Math.min(LADDER_LEVELS, passed + 1)
+  const checkpoint = ladderCheckpoint(passed)
+
+  // Estados finales
+  if (['retired', 'eliminated', 'summit'].includes(ladder.state) || ladder.status === 'finished') {
+    const lvl = ladder.result_level ?? passed
+    const title = ladder.state === 'summit' ? '¡Llegaste a la cima de La Escalera Bíblica!'
+      : ladder.state === 'eliminated' ? 'Quedaste fuera de la Escalera'
+        : ladder.status === 'finished' && ladder.state !== 'retired' ? 'La Escalera terminó' : 'Te retiraste a tiempo'
+    return (
+      <div className="card animate-rise p-6 text-center">
+        <div className="animate-pop text-6xl">{ladder.state === 'summit' ? '🏆' : ladder.state === 'eliminated' ? '💀' : '🔒'}</div>
+        <h2 className="mt-2 font-display text-3xl font-bold">{title}</h2>
+        <div className="mt-4"><Rungs passed={passed} /></div>
+        <p className="mt-4 text-indigo-200">
+          {ladder.state === 'eliminated'
+            ? lvl > 0 ? `Llegaste al nivel ${passed}, pero vuelves a tu último checkpoint: el nivel ${lvl}.` : 'No alcanzaste ningún checkpoint.'
+            : `Te quedas con el nivel ${lvl}.`}
+        </p>
+        <div className={`mt-5 rounded-2xl px-4 py-4 ${lvl > 0 ? 'bg-emerald-500/20' : 'bg-white/10'}`}>
+          <p className="font-display text-3xl font-bold tabular-nums text-amber-300">💰 {fmt(ladderValue(lvl))}</p>
+          <p className="mt-1 font-bold">= {ladder.points ?? ladderPoints(lvl)} puntos del campeonato</p>
+        </div>
+        <p className="mt-4 text-sm text-indigo-300">
+          {ladder.at_top > 0 ? `🏆 ${ladder.at_top} en la cima · ` : ''}Mira la pantalla para ver cómo van los demás.
+        </p>
+      </div>
+    )
+  }
+
+  // Desafío abierto
+  if (ladder.state === 'playing' && ladder.challenge) {
+    return (
+      <div className="card animate-rise p-5">
+        <LadderHeader ladder={ladder} level={level}
+          extra={left !== null && <CountdownRing seconds={left} total={ladderSeconds(level)} size={56} />} />
+        <p className="text-xs uppercase tracking-wider text-indigo-300">{ladder.challenge.kind}</p>
+        <h2 className="mt-1 font-display text-2xl font-bold leading-snug">{ladder.challenge.prompt}</h2>
+        {ladder.challenge.hint && <p className="mt-3 rounded-xl bg-white/10 px-3 py-2 text-sm text-indigo-100">💡 {ladder.challenge.hint}</p>}
+        {left === 0 ? (
+          <p className="mt-6 text-center font-bold text-rose-200">⏰ Se acabó el tiempo…</p>
+        ) : (
+          <LadderAnswer key={`${passed}-${lives}`} challenge={ladder.challenge} token={token} refresh={refresh} />
+        )}
+      </div>
+    )
+  }
+
+  // Falló: usar un salvavidas o terminar
+  if (ladder.state === 'failed') {
+    return (
+      <div className="card animate-rise p-6 text-center">
+        <LadderHeader ladder={ladder} level={level} />
+        <div className="text-5xl">{ladder.failed_reason === 'timeout' ? '⏰' : '❌'}</div>
+        <h2 className="mt-2 font-display text-2xl font-bold">
+          {ladder.failed_reason === 'timeout' ? 'Se acabó el tiempo' : 'Respuesta incorrecta'}
+        </h2>
+        <div className="mt-3"><Hearts lives={lives} big /></div>
+        <p className="mt-3 text-lg font-bold">¿Quieres utilizar un salvavidas para continuar?</p>
+        <p className="text-sm text-indigo-200">Recibirás otro desafío del nivel {level} y conservas lo que llevas.</p>
+        <ErrorBox>{error}</ErrorBox>
+        <button className="btn-primary mt-5 w-full py-4 text-lg" onClick={() => act('lifeline')} disabled={busy}>
+          ❤️ Usar un salvavidas (te quedarán {lives - 1})
+        </button>
+        <button className="btn-secondary mt-3 w-full py-3" onClick={() => {
+          if (confirm(`¿Terminar aquí? Te quedas con tu último checkpoint: ${checkpoint > 0 ? `nivel ${checkpoint} (${ladderPoints(checkpoint)} pts)` : '0 puntos'}.`)) act('quit')
+        }} disabled={busy}>
+          Terminar aquí · {checkpoint > 0 ? `me quedo con el checkpoint ${checkpoint}` : 'sin puntos'}
+        </button>
+      </div>
+    )
+  }
+
+  // Aún no empieza
+  if (passed === 0) {
+    return (
+      <div className="card animate-rise p-6 text-center">
+        <div className="text-6xl">🪜</div>
+        <h2 className="mt-2 font-display text-3xl font-bold">La Escalera Bíblica</h2>
+        <div className="mt-3"><Hearts lives={lives} big /></div>
+        <ul className="mt-4 space-y-1.5 text-left text-sm text-indigo-100">
+          <li>⬆️ 20 niveles, cada vez más difíciles. Tu valor se <b>duplica</b> con cada nivel.</li>
+          <li>🤔 Después de cada nivel decides: asegurar y retirarte, o seguir subiendo sin ver el siguiente reto.</li>
+          <li>❤️ Si fallas, puedes gastar un salvavidas y recibir otro desafío del mismo nivel.</li>
+          <li>🔒 Checkpoints en los niveles {LADDER_CHECKPOINTS.join(', ')}: si te eliminan, vuelves al último.</li>
+          <li>⏱️ De {ladderSeconds(1)} s (niveles fáciles) a {ladderSeconds(20)} s (los más difíciles) por desafío.</li>
+        </ul>
+        <ErrorBox>{error}</ErrorBox>
+        <button className="btn-primary mt-5 w-full py-4 text-xl" onClick={() => act('next')} disabled={busy}>🧗 Comenzar el Nivel 1</button>
+      </div>
+    )
+  }
+
+  // Superó un nivel: asegurar o seguir (sin ver el siguiente desafío)
+  const justCheckpoint = LADDER_CHECKPOINTS.includes(passed)
+  return (
+    <div className="card animate-rise p-6 text-center">
+      <LadderHeader ladder={ladder} level={passed} />
+      <div className="animate-pop text-6xl">✅</div>
+      <h2 className="mt-2 font-display text-3xl font-bold">¡Superaste el Nivel {passed}!</h2>
+      <p className="mt-1 font-display text-3xl font-bold tabular-nums text-amber-300">💰 {fmt(ladderValue(passed))}</p>
+      {justCheckpoint && (
+        <p className="animate-pop mt-3 rounded-xl bg-emerald-500/20 px-3 py-2 font-bold text-emerald-100">🔒 Checkpoint alcanzado: el nivel {passed} ya es tuyo</p>
+      )}
+      <div className="mt-5 grid gap-3">
+        <button className="btn-primary py-4 text-lg" onClick={() => act('next')} disabled={busy}>
+          ⬆️ Continuar subiendo al nivel {level}
+          <span className="block text-sm font-normal opacity-80">vale 💰 {fmt(ladderValue(level))} · {ladderSeconds(level)} s</span>
+        </button>
+        <button className="btn-secondary py-3" onClick={() => {
+          if (confirm(`¿Asegurar y retirarte? Es definitivo: te quedas con el nivel ${passed} (${ladderPoints(passed)} pts).`)) act('retire')
+        }} disabled={busy}>
+          🔒 Asegurar y retirarme · {ladderPoints(passed)} pts
+        </button>
+      </div>
+      <p className="mt-4 text-xs text-indigo-300">
+        Si sigues y fallas sin usar salvavidas, vuelves a {checkpoint > 0 ? `tu checkpoint: nivel ${checkpoint} (${ladderPoints(checkpoint)} pts)` : 'cero: aún no tienes checkpoint'}.
+      </p>
+      <ErrorBox>{error}</ErrorBox>
+    </div>
+  )
+}
+
+function LadderAnswer({ challenge, token, refresh }: {
+  challenge: NonNullable<LadderInfo['challenge']>; token: string; refresh: () => Promise<void>
+}) {
+  const [text, setText] = useState('')
+  const [book, setBook] = useState('')
+  const [chapter, setChapter] = useState('')
+  const [verse, setVerse] = useState('')
+  const [sending, setSending] = useState(false)
+  const [error, setError] = useState('')
+
+  async function send(params: Record<string, unknown>) {
+    if (sending) return
+    setSending(true)
+    setError('')
+    const { data, error } = await playerClient.rpc('ladder_answer', { p_token: token, ...params })
+    setSending(false)
+    if (error) return setError(errorMessage(error))
+    if (data.ok && data.correct) {
+      celebrate()
+      vibrate([80, 40, 80])
+    } else if (data.ok) {
+      vibrate(250)
+    } else {
+      setError(data.reason === 'timeout' ? 'Se acabó el tiempo.' : 'Ya no se puede responder este desafío.')
+    }
+    refresh()
+  }
+
+  if (challenge.answer_type === 'choice') {
+    return (
+      <div className="mt-5 grid gap-2">
+        {(challenge.options ?? []).map((o, i) => (
+          <button key={i} className={`btn min-h-14 justify-start px-4 text-left text-white ${OPTION_STYLES[i].bg}`}
+            onClick={() => send({ p_choice: i })} disabled={sending}>
+            <span className="text-xl">{OPTION_STYLES[i].shape}</span><span className="flex-1">{o}</span>
+          </button>
+        ))}
+        <ErrorBox>{error}</ErrorBox>
+      </div>
+    )
+  }
+
+  if (challenge.answer_type === 'reference') {
+    return (
+      <form className="mt-5" onSubmit={(e) => { e.preventDefault(); send({ p_book: book, p_chapter: Number(chapter), p_verse: Number(verse) }) }}>
+        <label className="label" htmlFor="l-book">Libro</label>
+        <select id="l-book" className="input py-3 text-lg" value={book} onChange={(e) => setBook(e.target.value)} required>
+          <option value="">Elige el libro…</option>
+          {BIBLE_BOOKS.map((b) => <option key={b} value={b}>{b}</option>)}
+        </select>
+        <div className="mt-3 grid grid-cols-2 gap-3">
+          <div>
+            <label className="label" htmlFor="l-ch">Capítulo</label>
+            <input id="l-ch" className="input py-3 text-center text-xl" type="number" inputMode="numeric" min={1} max={150}
+              value={chapter} onChange={(e) => setChapter(e.target.value)} required />
+          </div>
+          <div>
+            <label className="label" htmlFor="l-v">Versículo</label>
+            <input id="l-v" className="input py-3 text-center text-xl" type="number" inputMode="numeric" min={1} max={200}
+              value={verse} onChange={(e) => setVerse(e.target.value)} required />
+          </div>
+        </div>
+        <div className="mt-2"><ErrorBox>{error}</ErrorBox></div>
+        <button className="btn-primary mt-4 w-full py-4 text-lg" disabled={!book || !chapter || !verse || sending}>
+          {sending ? 'Comprobando…' : 'Responder (un solo intento)'}
+        </button>
+      </form>
+    )
+  }
+
+  return (
+    <form className="mt-5" onSubmit={(e) => { e.preventDefault(); if (text.trim()) send({ p_text: text }) }}>
+      <input className="input py-4 text-xl" value={text} onChange={(e) => setText(e.target.value)}
+        placeholder="Escribe tu respuesta…" maxLength={80} autoComplete="off" autoCapitalize="words" enterKeyHint="send" autoFocus
+        aria-label="Tu respuesta" />
+      <div className="mt-2"><ErrorBox>{error}</ErrorBox></div>
+      <button className="btn-primary mt-4 w-full py-4 text-lg" disabled={!text.trim() || sending}>
+        {sending ? 'Comprobando…' : 'Responder (un solo intento)'}
+      </button>
+    </form>
   )
 }
 

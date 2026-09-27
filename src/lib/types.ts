@@ -1,5 +1,5 @@
 export type Difficulty = 'facil' | 'intermedio' | 'dificil'
-export type Game = 'emoji' | 'quiz' | 'taboo' | 'cipher' | 'auction' | 'timeline'
+export type Game = 'emoji' | 'quiz' | 'taboo' | 'cipher' | 'auction' | 'timeline' | 'ladder'
 export type CipherKind = 'numeros' | 'reverso' | 'anagrama' | 'desplazado' | 'sin_vocales' | 'acertijo' | 'frase'
 export type RoomView = 'lobby' | 'round' | 'leaderboard' | 'podium'
 export type RoundStatus = 'pending' | 'active' | 'revealed'
@@ -18,7 +18,7 @@ export const DIFFICULTY_STYLE: Record<Difficulty, string> = {
   dificil: 'bg-rose-400/20 text-rose-200',
 }
 
-export const GAMES: Game[] = ['emoji', 'quiz', 'taboo', 'cipher', 'auction', 'timeline']
+export const GAMES: Game[] = ['emoji', 'quiz', 'taboo', 'cipher', 'auction', 'timeline', 'ladder']
 
 export const GAME_LABEL: Record<Game, string> = {
   emoji: 'Adivina con emojis',
@@ -27,13 +27,14 @@ export const GAME_LABEL: Record<Game, string> = {
   cipher: 'Código secreto bíblico',
   auction: 'Subasta bíblica',
   timeline: 'Línea del tiempo humana',
+  ladder: 'Escalera bíblica',
 }
 
 export const GAME_SHORT: Record<Game, string> = {
-  emoji: 'Emojis', quiz: 'Selección', taboo: 'Tabú', cipher: 'Código', auction: 'Subasta', timeline: 'Línea',
+  emoji: 'Emojis', quiz: 'Selección', taboo: 'Tabú', cipher: 'Código', auction: 'Subasta', timeline: 'Línea', ladder: 'Escalera',
 }
 
-export const GAME_ICON: Record<Game, string> = { emoji: '😀', quiz: '❓', taboo: '🤫', cipher: '🔐', auction: '🔨', timeline: '🧍' }
+export const GAME_ICON: Record<Game, string> = { emoji: '😀', quiz: '❓', taboo: '🤫', cipher: '🔐', auction: '🔨', timeline: '🧍', ladder: '🪜' }
 
 export const CIPHER_KINDS: CipherKind[] = ['numeros', 'reverso', 'anagrama', 'desplazado', 'sin_vocales', 'acertijo', 'frase']
 
@@ -78,6 +79,17 @@ export const AUCTION_MAX_BID = 150
 export const TIMELINE_PLACE_POINTS = [100, 80, 65, 50]
 export const TIMELINE_WRONG_PENALTY = 10
 export const TIMELINE_MIN_POINTS = 30
+
+// Escalera: deben coincidir con ladder_value / ladder_points / ladder_checkpoint / ladder_seconds en schema.sql
+export const LADDER_LEVELS = 20
+export const LADDER_LIVES = 3
+export const LADDER_CHECKPOINTS = [3, 6, 9, 12, 15, 18]
+/** Tramos de dificultad: niveles 1–5, 6–10, 11–15 y 16–20. */
+export const LADDER_TIER_LABEL = ['', 'Niveles 1–5', 'Niveles 6–10', 'Niveles 11–15', 'Niveles 16–20']
+export const LADDER_TIER_SECONDS = [0, 20, 30, 45, 60]
+
+export type LadderAnswerType = 'text' | 'choice' | 'reference'
+export type LadderState = 'deciding' | 'playing' | 'failed' | 'retired' | 'eliminated' | 'summit'
 
 /** Categorías sugeridas; el banco acepta otras escritas a mano. */
 export const AUCTION_CATEGORIES = [
@@ -181,6 +193,43 @@ export interface AuctionQuestion {
   answer: string
   aliases: string[]
   reference: string | null
+}
+
+export interface LadderChallenge {
+  id: string
+  tier: number
+  kind: string
+  prompt: string
+  hint: string | null
+  answer_type: LadderAnswerType
+  answer: string
+  aliases: string[]
+  options: string[] | null
+  correct_index: number | null
+  verse_book: string | null
+  verse_chapter: number | null
+  verse_from: number | null
+  verse_to: number | null
+}
+
+/** Fila de ladder_board: el progreso de una persona, sin respuestas. */
+export interface LadderRow {
+  participant_id: string
+  name: string
+  state: LadderState
+  passed: number
+  lives: number
+  checkpoint: number
+  deadline: string | null
+  result_level: number | null
+  points: number | null
+}
+
+export interface LadderBoard {
+  id: string
+  status: 'running' | 'finished'
+  round_id: string
+  players: LadderRow[]
 }
 
 export interface TimelineSet {
@@ -384,6 +433,28 @@ export interface PlayerState {
       balance_after: number | null
     } | null
     standings: { name: string; seq: number; balance: number }[]
+  } | null
+  /** Escalera: el progreso propio y, mientras juega, su desafío (nunca la respuesta). */
+  ladder: {
+    status: 'running' | 'finished'
+    joined: boolean
+    state: LadderState | null
+    passed: number
+    lives: number
+    failed_reason: 'wrong' | 'timeout' | null
+    deadline: string | null
+    result_level: number | null
+    points: number | null
+    challenge: {
+      kind: string
+      prompt: string
+      hint: string | null
+      answer_type: LadderAnswerType
+      options: string[] | null
+    } | null
+    climbers: number
+    at_top: number
+    best: number | null
   } | null
   /** Línea del Tiempo: solo la tarjeta propia; el resto llega al acertar o al revelar. */
   timeline: {

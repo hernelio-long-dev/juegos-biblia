@@ -1,5 +1,5 @@
 import {
-  AUCTION_MAX_BID, AUCTION_MIN_BID, CIPHER_BASE, TIMELINE_MIN_POINTS, TIMELINE_PLACE_POINTS, TIMELINE_WRONG_PENALTY, CIPHER_PER_SECOND, CIPHER_SECONDS, DIFFICULTY_MULTIPLIER, EMOJI_TIERS, QUIZ_BASE,
+  AUCTION_MAX_BID, AUCTION_MIN_BID, CIPHER_BASE, LADDER_CHECKPOINTS, LADDER_TIER_SECONDS, TIMELINE_MIN_POINTS, TIMELINE_PLACE_POINTS, TIMELINE_WRONG_PENALTY, CIPHER_PER_SECOND, CIPHER_SECONDS, DIFFICULTY_MULTIPLIER, EMOJI_TIERS, QUIZ_BASE,
   TABOO_BASE, TABOO_PER_SECOND, TABOO_SECONDS, VERSE_BASE, VERSE_PER_SECOND, VERSE_SECONDS,
   type Difficulty,
 } from './types'
@@ -64,4 +64,28 @@ export function timelineTeamCount(players: number): number {
 export function timelinePoints(difficulty: Difficulty, place: number, wrong = 0): number {
   const base = TIMELINE_PLACE_POINTS[Math.min(Math.max(place, 1), TIMELINE_PLACE_POINTS.length) - 1]
   return Math.round(Math.max(TIMELINE_MIN_POINTS, base - TIMELINE_WRONG_PENALTY * wrong) * DIFFICULTY_MULTIPLIER[difficulty])
+}
+
+/** Escalera: valor interno. 3 en el nivel 1 y se duplica (6, 12, 24… 1 572 864). Coincide con ladder_value. */
+export function ladderValue(level: number): number {
+  return level <= 0 ? 0 : 3 * 2 ** (level - 1)
+}
+
+/** Escalera: puntos de campeonato, 15 por nivel + un bono que crece ~50,8 % por nivel hasta 3700 (cima = 4000). Coincide con ladder_points. */
+export function ladderPoints(level: number): number {
+  return level <= 0 ? 0 : 15 * level + Math.round(3700 ** (level / 20))
+}
+
+/** Último checkpoint superado (0 si ninguno). Coincide con ladder_checkpoint. */
+export function ladderCheckpoint(passed: number): number {
+  return Math.max(0, ...LADDER_CHECKPOINTS.filter((c) => c <= passed))
+}
+
+export function ladderTier(level: number): number {
+  return Math.min(4, Math.ceil(level / 5))
+}
+
+/** Segundos para responder un desafío de ese nivel. Coincide con ladder_seconds. */
+export function ladderSeconds(level: number): number {
+  return LADDER_TIER_SECONDS[ladderTier(level)]
 }
