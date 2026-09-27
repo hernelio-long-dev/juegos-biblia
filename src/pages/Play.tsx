@@ -10,7 +10,7 @@ import { errorMessage, playerClient, requestTimeout } from '../lib/supabase'
 import {
   AUCTION_ANSWER_SECONDS, AUCTION_BID_SECONDS, AUCTION_MIN_BID, BIBLE_BOOKS, CIPHER_KIND_LABEL, CIPHER_SECONDS,
   DIFFICULTY_LABEL, DIFFICULTY_MULTIPLIER, EMOJI_FINAL_SECONDS, GAME_LABEL, OPTION_STYLES,
-  QUIZ_SECONDS, TABOO_SECONDS, VERSE_SECONDS, teamStyle,
+  QUIZ_SECONDS, TABOO_SECONDS, TIMELINE_MAX_WRONG, TIMELINE_SECONDS, VERSE_SECONDS, teamStyle,
   type PlayerState,
 } from '../lib/types'
 
@@ -123,7 +123,9 @@ export default function Play() {
         ) : auctionTeams ? (
           <AuctionTeamCard state={state} token={token} refresh={refresh} />
         ) : room.view === 'round' && round ? (
-          round.game === 'auction'
+          round.game === 'timeline'
+            ? <TimelinePlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
+            : round.game === 'auction'
             ? <AuctionPlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
             : round.game === 'emoji'
             ? <EmojiPlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
@@ -134,6 +136,12 @@ export default function Play() {
                 : <QuizPlay key={round.id} state={state} round={round} token={token} now={now} refresh={refresh} />
         ) : (
           <InfoCard emoji="🙌" title={`¡Ya estás dentro, ${me.name.split(' ')[0]}!`} text="Espera a que el administrador inicie el juego. Mantén esta pantalla abierta.">
+            {me.team && (
+              <div className={`mt-5 rounded-2xl px-4 py-3 ${teamStyle(me.team.seq).soft}`}>
+                <p className="font-display text-xl font-bold">{me.team.name}</p>
+                <p className="text-sm">{me.team.members.join(' · ')}</p>
+              </div>
+            )}
             <div className="mt-6 flex justify-center gap-2">
               {[0, 1, 2].map((i) => (
                 <span key={i} className="h-3 w-3 animate-bounce rounded-full bg-amber-300" style={{ animationDelay: `${i * 150}ms` }} />
@@ -790,6 +798,178 @@ function TabooPlay({ state, round, now }: { state: PlayerState; round: Round; no
         <p className="mt-6 text-sm text-indigo-300">Tú juegas con <b>{state.me.team.name}</b>.</p>
       )}
     </InfoCard>
+  )
+}
+
+// ---------------------------------------------------------------- LÍNEA DEL TIEMPO HUMANA
+const TIMELINE_REASONS: Record<string, string> = {
+  closed: 'La ronda ya terminó.',
+  timeout: 'Se acabó el tiempo.',
+  no_card: 'No tienes tarjeta en esta ronda.',
+  max_attempts: 'Tu equipo ya usó todos sus intentos.',
+  cooldown: 'Esperen unos segundos antes de volver a intentar.',
+  invalid: 'Falta alguien o hay un nombre repetido. Vuelvan a marcar la fila.',
+}
+
+function TimelinePlay({ state, round, token, now, refresh }: PlayProps) {
+  const tl = state.timeline
+  const result = tl?.result ?? null
+  const left = secondsLeft(round.deadline, now) ?? 0
+  const retryIn = secondsLeft(result?.retry_at ?? null, now) ?? 0
+  const revealed = round.status === 'revealed'
+  const [ordering, setOrdering] = useState(false)
+  const [order, setOrder] = useState<string[]>([])
+  const [sending, setSending] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => { vibrate(60) }, [])
+  // Cuando un compañero confirma la línea correcta, todos los celulares del equipo celebran.
+  const solved = result?.solved === true
+  useEffect(() => {
+    if (solved) {
+      celebrate()
+      vibrate([80, 40, 80])
+    }
+  }, [solved])
+  // Si otro compañero envió un orden incorrecto, se cierra la selección aquí también.
+  const wrong = result?.wrong ?? 0
+  useEffect(() => {
+    if (wrong > 0) {
+      setOrdering(false)
+      setOrder([])
+    }
+  }, [wrong])
+
+  if (!tl?.card) {
+    return (
+      <InfoCard emoji="🧍" title="Línea del tiempo humana"
+        text={state.me.team
+          ? 'Las tarjetas de esta ronda ya se repartieron. Entrarás en la siguiente.'
+          : 'Te sumaremos a un equipo al comenzar la siguiente ronda. Mantén esta pantalla abierta.'} />
+    )
+  }
+
+  const mates = tl.teammates
+  const nameOf = (id: string) => mates.find((m) => m.id === id)?.name ?? '—'
+
+  async function check() {
+    if (sending || order.length !== mates.length) return
+    setSending(true)
+    setError('')
+    const { data, error } = await playerClient.rpc('submit_timeline', { p_token: token, p_round: round.id, p_order: order })
+    setSending(false)
+    if (error) return setError(errorMessage(error))
+    if (data.ok && !data.correct) vibrate(250)
+    else if (!data.ok) setError(TIMELINE_REASONS[data.reason] ?? 'No se pudo enviar.')
+    refresh()
+  }
+
+  if (revealed) {
+    const mine = new Set(tl.team_order?.map((c) => c.event))
+    return (
+      <div className="card animate-rise p-6">
+        <RoundHeader round={round} />
+        <p className="text-center text-sm uppercase tracking-wider text-indigo-200">El orden correcto</p>
+        <ol className="mt-3 space-y-1.5">
+          {tl.solution?.events.map((e, i) => (
+            <li key={i} className={`flex items-center gap-3 rounded-xl px-3 py-2 ${mine.has(e) ? 'bg-amber-400 font-bold text-indigo-950' : 'bg-white/5'}`}>
+              <span className="w-5 text-center font-display font-bold opacity-60">{i + 1}</span>
+              <span className="flex-1">{e}</span>
+              {e === tl.card && <span className="text-xs font-bold uppercase">tu tarjeta</span>}
+            </li>
+          ))}
+        </ol>
+        {tl.solution?.explanation && <p className="mt-4 rounded-xl bg-white/10 px-3 py-2 text-sm text-indigo-100">📖 {tl.solution.explanation}</p>}
+        <ResultBanner correct={solved} points={result?.points ?? 0} answered
+          detail={solved ? `${result?.place}º lugar · cada integrante suma estos puntos` : 'Tu equipo no completó la línea a tiempo'} />
+      </div>
+    )
+  }
+
+  if (solved) {
+    return (
+      <div className="card animate-rise p-6 text-center">
+        <RoundHeader round={round} />
+        <div className="animate-pop text-6xl">✅</div>
+        <h2 className="mt-2 font-display text-3xl font-bold">¡Línea del tiempo correcta!</h2>
+        <p className="mt-1 text-xl font-bold text-amber-300">{result?.place}º lugar · +{result?.points} para cada integrante</p>
+        <ol className="mt-5 space-y-1.5 text-left">
+          {tl.team_order?.map((c, i) => (
+            <li key={i} className="flex items-center gap-3 rounded-xl bg-emerald-500/15 px-3 py-2">
+              <span className="w-5 text-center font-display font-bold">{i + 1}</span>
+              <span className="flex-1 font-bold">{c.event}</span>
+              <span className="text-sm text-indigo-200">{c.name}</span>
+            </li>
+          ))}
+        </ol>
+        <p className="mt-5 text-sm text-indigo-300">No digan el orden en voz alta: otros equipos siguen jugando. ({tl.teams_solved} de {tl.teams_total} terminaron)</p>
+      </div>
+    )
+  }
+
+  const out = wrong >= TIMELINE_MAX_WRONG
+  return (
+    <div className="animate-rise">
+      <div className="card p-5">
+        <RoundHeader round={round} extra={<span className="ml-auto"><CountdownRing seconds={left} total={TIMELINE_SECONDS} size={56} /></span>} />
+        <p className="text-center text-xs uppercase tracking-wider text-indigo-300">{round.category}</p>
+        <div className="mt-3 rounded-3xl bg-amber-400 px-5 py-6 text-center text-indigo-950 shadow-lg shadow-amber-500/20">
+          <p className="text-xs font-bold uppercase tracking-wider opacity-70">Tu tarjeta secreta</p>
+          <p className="mt-1 font-display text-3xl font-bold leading-tight">{tl.card}</p>
+        </div>
+        <p className="mt-3 text-center text-sm text-indigo-200">
+          Solo tú la ves. Cuéntale a tu equipo qué tienes y pónganse en fila, del más antiguo al más reciente.
+        </p>
+      </div>
+
+      <div className="card mt-4 p-5">
+        {wrong > 0 && !out && (
+          <p className="mb-4 rounded-xl bg-amber-400/15 px-3 py-2 text-center text-sm font-bold text-amber-100">
+            ⚠️ Hay posiciones incorrectas. Revisen nuevamente su línea del tiempo.
+            <span className="block font-normal opacity-80">Les quedan {TIMELINE_MAX_WRONG - wrong} intentos · cada error resta puntos</span>
+          </p>
+        )}
+        {left === 0 ? (
+          <p className="text-center font-bold text-rose-200">⏰ Se acabó el tiempo</p>
+        ) : out ? (
+          <p className="text-center font-bold text-rose-200">🔒 Tu equipo ya usó sus {TIMELINE_MAX_WRONG} intentos. Espera la respuesta.</p>
+        ) : !ordering ? (
+          <button className="btn-primary w-full py-5 text-xl" onClick={() => { setOrdering(true); setOrder([]) }} disabled={retryIn > 0}>
+            {retryIn > 0 ? `Muévanse y revisen… (${retryIn} s)` : '✋ Estamos listos'}
+          </button>
+        ) : (
+          <div>
+            <p className="text-center text-sm text-indigo-200">
+              Toca los nombres en el orden de la fila, empezando por quien tiene lo <b>más antiguo</b>.
+            </p>
+            <ol className="mt-3 space-y-1.5">
+              {order.map((id, i) => (
+                <li key={id} className="flex items-center gap-3 rounded-xl bg-white/10 px-3 py-2 font-bold">
+                  <span className="flex h-7 w-7 items-center justify-center rounded-full bg-amber-400 font-display text-indigo-950">{i + 1}</span>
+                  {nameOf(id)}
+                </li>
+              ))}
+            </ol>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {mates.filter((m) => !order.includes(m.id)).map((m) => (
+                <button key={m.id} className="btn-secondary flex-1 py-3 text-lg" onClick={() => setOrder([...order, m.id])}>
+                  {m.name}
+                </button>
+              ))}
+            </div>
+            <div className="mt-2"><ErrorBox>{error}</ErrorBox></div>
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              <button className="btn-ghost py-3" onClick={() => (order.length ? setOrder(order.slice(0, -1)) : setOrdering(false))} disabled={sending}>
+                {order.length ? '↩ Deshacer' : 'Cancelar'}
+              </button>
+              <button className="btn-primary py-3 text-lg" onClick={check} disabled={sending || order.length !== mates.length || retryIn > 0}>
+                {sending ? 'Comprobando…' : 'Comprobar'}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
   )
 }
 

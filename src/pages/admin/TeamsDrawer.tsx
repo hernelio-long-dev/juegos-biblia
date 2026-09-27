@@ -58,7 +58,7 @@ export default function TeamsDrawer({ roomId, teams, players, onClose, onChanged
           <button className="btn-ghost px-3 py-1" onClick={onClose} aria-label="Cerrar">✕</button>
         </div>
         <p className="text-sm text-indigo-200">
-          Se usan en Tabú y en la Subasta bíblica (que también los forma sola, de 3 o 4). El sistema reparte
+          Se usan en Tabú, la Subasta bíblica (que los forma sola, de 3 o 4) y la Línea del tiempo (de 4 o más). El sistema reparte
           al azar a los {players.length} que están en la sala, en grupos del mismo tamaño.
         </p>
 

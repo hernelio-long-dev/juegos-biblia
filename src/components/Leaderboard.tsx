@@ -2,7 +2,7 @@ import { teamStyle, type ScoreRow, type TeamScoreRow } from '../lib/types'
 
 const MEDALS = ['🥇', '🥈', '🥉']
 
-/** Tabla por equipos (Tabú bíblico). */
+/** Tabla por equipos (Tabú bíblico y Línea del tiempo). */
 export function TeamLeaderboard({ rows, big = false }: { rows: TeamScoreRow[]; big?: boolean }) {
   if (rows.length === 0) {
     return <p className="py-8 text-center text-indigo-200">Todavía no hay equipos. Ármalos desde «🤝 Equipos».</p>

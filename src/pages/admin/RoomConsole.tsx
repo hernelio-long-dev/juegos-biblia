@@ -6,7 +6,7 @@ import { CountdownRing, DifficultyChip, ErrorBox, Spinner } from '../../componen
 import { secondsLeft, useClockSync, useServerNow } from '../../lib/clock'
 import { celebrate } from '../../lib/fx'
 import { useLiveRefresh } from '../../lib/realtime'
-import { emojiPoints } from '../../lib/scoring'
+import { emojiPoints, timelineTeamCount } from '../../lib/scoring'
 import { errorMessage, supabase } from '../../lib/supabase'
 import {
   CIPHER_KIND_LABEL, CIPHER_SECONDS, DIFFICULTIES, DIFFICULTY_LABEL, EMOJI_FINAL_SECONDS, GAME_ICON,
@@ -16,6 +16,7 @@ import {
 } from '../../lib/types'
 import TeamsDrawer, { suggestedTeams } from './TeamsDrawer'
 import { AuctionLauncher, AuctionRoundStage, AuctionTeamsStage, useAuction } from './AuctionStage'
+import { TimelineStage, useTimeline } from './TimelineStage'
 
 type Remaining = Record<Game, Record<Difficulty, number>>
 type BoardView = Game | 'teams' | null
@@ -97,18 +98,19 @@ export default function RoomConsole() {
   }, [roomId])
 
   const loadRemaining = useCallback(async () => {
-    const [{ data: e }, { data: q }, { data: tb }, { data: ci }, { data: au }, { data: used }] = await Promise.all([
+    const [{ data: e }, { data: q }, { data: tb }, { data: ci }, { data: au }, { data: tl }, { data: used }] = await Promise.all([
       supabase.from('emoji_items').select('id, difficulty'),
       supabase.from('quiz_questions').select('id, difficulty'),
       supabase.from('taboo_items').select('id, difficulty'),
       supabase.from('cipher_items').select('id, difficulty'),
       supabase.from('auction_questions').select('id, difficulty'),
+      supabase.from('timeline_sets').select('id, difficulty'),
       supabase.from('rounds').select('item_id').eq('room_id', roomId),
     ])
     const usedSet = new Set((used ?? []).map((u) => u.item_id))
     const count = (rows: { id: string; difficulty: Difficulty }[] | null) =>
       Object.fromEntries(DIFFICULTIES.map((d) => [d, (rows ?? []).filter((x) => x.difficulty === d && !usedSet.has(x.id)).length])) as Record<Difficulty, number>
-    setRemaining({ emoji: count(e), quiz: count(q), taboo: count(tb), cipher: count(ci), auction: count(au) })
+    setRemaining({ emoji: count(e), quiz: count(q), taboo: count(tb), cipher: count(ci), auction: count(au), timeline: count(tl) })
   }, [roomId])
 
   const roundId = round?.id ?? null
@@ -166,12 +168,27 @@ export default function RoomConsole() {
   }, [loadRoom])
 
   const auction = useAuction(roomId, round, now, run, loadRoom)
+  const timeline = useTimeline(round, now, loadRoom)
+
+  // Línea del Tiempo: equipos de 4 o más con todos los que están en la sala.
+  const formTimelineTeams = useCallback(async () => {
+    if (teams.length > 0 && !confirm('¿Rehacer los equipos en grupos de 4 o más? Los puntos ya ganados se conservan.')) return
+    setBusy(true)
+    setError('')
+    const { error } = await supabase.rpc('assign_teams', { p_room: roomId, p_teams: timelineTeamCount(players.length) })
+    setBusy(false)
+    if (error) setError(errorMessage(error))
+    loadTeams()
+  }, [teams.length, roomId, players.length, loadTeams])
 
   const startRound = useCallback(async (g: Game = game, d: Difficulty = difficulty) => {
     setGame(g)
     setDifficulty(d)
     if (g === 'auction') {
       await auction.next(auctionMix ? null : d)
+    } else if (g === 'timeline') {
+      await run(() => supabase.rpc('start_timeline_round', { p_room: roomId, p_difficulty: d }))
+      loadTeams() // si la sala no tenía equipos, el servidor los acaba de formar
     } else if (g === 'taboo') {
       if (!teamId) return setError('Primero arma los equipos desde «🤝 Equipos».')
       await run(() => supabase.rpc('start_taboo_round', { p_room: roomId, p_difficulty: d, p_team: teamId }))
@@ -182,7 +199,7 @@ export default function RoomConsole() {
       await run(() => supabase.rpc('start_round', { p_room: roomId, p_game: g, p_difficulty: d }))
     }
     loadRemaining()
-  }, [game, difficulty, run, roomId, loadRemaining, teamId, teams, auction, auctionMix])
+  }, [game, difficulty, run, roomId, loadRemaining, teamId, teams, auction, auctionMix, loadTeams])
 
   const startTaboo = useCallback(() => {
     if (round?.game === 'taboo' && round.status === 'pending') {
@@ -230,7 +247,7 @@ export default function RoomConsole() {
   const autoRevealed = useRef<string | null>(null)
   useEffect(() => {
     if (!round || round.status !== 'active' || autoRevealed.current === round.id) return
-    if (round.game === 'auction') return // lo maneja useAuction
+    if (round.game === 'auction' || round.game === 'timeline') return // lo manejan useAuction y useTimeline
     if (now < new Date(round.started_at).getTime()) return
     const correctCount = roundAnswers.filter((a) => a.is_correct).length
 
@@ -350,6 +367,9 @@ export default function RoomConsole() {
         {view === 'round' && round && round.game === 'cipher' && (
           <CipherStage round={round} item={cipherItem} peek={peek} answers={roundAnswers} players={players} now={now} />
         )}
+        {view === 'round' && round?.game === 'timeline' && (
+          <TimelineStage data={timeline} round={round} teams={teams} peek={peek} now={now} />
+        )}
         {view === 'round' && auctionTeamsUp && (
           <AuctionTeamsStage data={auction} roomTeams={teams} players={players} now={now} />
         )}
@@ -417,7 +437,7 @@ export default function RoomConsole() {
                     🔒 Cerrar apuestas y mostrar pregunta
                   </button>
                 )}
-                {view === 'round' && round && round.status !== 'revealed' && (round.game === 'taboo' || round.game === 'cipher' || round.game === 'auction') && (
+                {view === 'round' && round && round.status !== 'revealed' && (round.game === 'taboo' || round.game === 'cipher' || round.game === 'auction' || round.game === 'timeline') && (
                   <button className="btn-ghost px-3 py-2 text-sm" onClick={() => setPeek((p) => !p)}>
                     {peek ? '🙈 Ocultar respuesta' : '👁️ Ver respuesta'}
                   </button>
@@ -447,6 +467,12 @@ export default function RoomConsole() {
                       {DIFFICULTY_LABEL[d]} <span className="opacity-60">{remaining?.[game][d] ?? '–'}</span>
                     </button>
                   ))}
+                  {game === 'timeline' && (
+                    <button className="btn-ghost px-3 py-2 text-sm" onClick={formTimelineTeams} disabled={busy || players.length < 2 || round?.status === 'active'}
+                      title={`${players.length} personas → ${timelineTeamCount(players.length)} ${timelineTeamCount(players.length) === 1 ? 'equipo' : 'equipos'}`}>
+                      🧍 Formar equipos de 4 o más
+                    </button>
+                  )}
                   {game === 'taboo' && (
                     <>
                       <span className="mx-1 h-6 w-px bg-white/15" />
@@ -495,6 +521,21 @@ export default function RoomConsole() {
                 {players.length >= 2 && <> (sugerencia: {suggestedTeams(players.length)} equipos)</>}.
               </p>
             )}
+            {game === 'timeline' && !closed && (() => {
+              const playing = teams.filter((t) => t.members.length > 0)
+              const bad = playing.length > 1 ? playing.filter((t) => t.members.length < 4) : []
+              const inTeam = new Set(teams.flatMap((t) => t.members.map((m) => m.id)))
+              const loose = players.filter((p) => !inTeam.has(p.participant_id)).length
+              if (teams.length === 0) return <p className="text-sm text-indigo-300">Al iniciar se formarán solos equipos de 4 o más con los {players.length} de la sala.</p>
+              if (bad.length > 0) return (
+                <p className="text-sm text-amber-200">
+                  Línea del tiempo necesita equipos de al menos 4 ({bad.map((t) => `${t.name}: ${t.members.length}`).join(', ')}).
+                  Pulsa «🧍 Formar equipos de 4 o más».
+                </p>
+              )
+              if (loose > 0) return <p className="text-sm text-indigo-300">{loose} sin equipo: al iniciar la ronda se suman solos al equipo más chico.</p>
+              return null
+            })()}
             {view === 'lobby' && !closed && players.length > 0 && (
               <p className="text-sm text-indigo-300">
                 {registered > 0 && players.length / registered >= 0.5

@@ -1,5 +1,5 @@
 import {
-  AUCTION_MAX_BID, AUCTION_MIN_BID, CIPHER_BASE, CIPHER_PER_SECOND, CIPHER_SECONDS, DIFFICULTY_MULTIPLIER, EMOJI_TIERS, QUIZ_BASE,
+  AUCTION_MAX_BID, AUCTION_MIN_BID, CIPHER_BASE, TIMELINE_MIN_POINTS, TIMELINE_PLACE_POINTS, TIMELINE_WRONG_PENALTY, CIPHER_PER_SECOND, CIPHER_SECONDS, DIFFICULTY_MULTIPLIER, EMOJI_TIERS, QUIZ_BASE,
   TABOO_BASE, TABOO_PER_SECOND, TABOO_SECONDS, VERSE_BASE, VERSE_PER_SECOND, VERSE_SECONDS,
   type Difficulty,
 } from './types'
@@ -51,6 +51,17 @@ export function auctionMaxBid(balance: number): number {
 }
 
 /** Equipos de 3 o 4 (10 personas → 4 + 3 + 3). Debe coincidir con start_auction. */
-export function auctionTeamCount(players: number): number {
+export function smallTeamCount(players: number): number {
   return Math.max(2, Math.ceil(players / 4))
+}
+
+/** Línea del Tiempo: equipos de 4 o más (10 → 5 + 5; 7 → uno de 7). Debe coincidir con start_timeline_round. */
+export function timelineTeamCount(players: number): number {
+  return Math.max(1, Math.floor(players / 4))
+}
+
+/** Debe coincidir con timeline_points en supabase/schema.sql. */
+export function timelinePoints(difficulty: Difficulty, place: number, wrong = 0): number {
+  const base = TIMELINE_PLACE_POINTS[Math.min(Math.max(place, 1), TIMELINE_PLACE_POINTS.length) - 1]
+  return Math.round(Math.max(TIMELINE_MIN_POINTS, base - TIMELINE_WRONG_PENALTY * wrong) * DIFFICULTY_MULTIPLIER[difficulty])
 }

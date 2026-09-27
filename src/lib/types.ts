@@ -1,5 +1,5 @@
 export type Difficulty = 'facil' | 'intermedio' | 'dificil'
-export type Game = 'emoji' | 'quiz' | 'taboo' | 'cipher' | 'auction'
+export type Game = 'emoji' | 'quiz' | 'taboo' | 'cipher' | 'auction' | 'timeline'
 export type CipherKind = 'numeros' | 'reverso' | 'anagrama' | 'desplazado' | 'sin_vocales' | 'acertijo' | 'frase'
 export type RoomView = 'lobby' | 'round' | 'leaderboard' | 'podium'
 export type RoundStatus = 'pending' | 'active' | 'revealed'
@@ -18,7 +18,7 @@ export const DIFFICULTY_STYLE: Record<Difficulty, string> = {
   dificil: 'bg-rose-400/20 text-rose-200',
 }
 
-export const GAMES: Game[] = ['emoji', 'quiz', 'taboo', 'cipher', 'auction']
+export const GAMES: Game[] = ['emoji', 'quiz', 'taboo', 'cipher', 'auction', 'timeline']
 
 export const GAME_LABEL: Record<Game, string> = {
   emoji: 'Adivina con emojis',
@@ -26,13 +26,14 @@ export const GAME_LABEL: Record<Game, string> = {
   taboo: 'Tabú bíblico',
   cipher: 'Código secreto bíblico',
   auction: 'Subasta bíblica',
+  timeline: 'Línea del tiempo humana',
 }
 
 export const GAME_SHORT: Record<Game, string> = {
-  emoji: 'Emojis', quiz: 'Selección', taboo: 'Tabú', cipher: 'Código', auction: 'Subasta',
+  emoji: 'Emojis', quiz: 'Selección', taboo: 'Tabú', cipher: 'Código', auction: 'Subasta', timeline: 'Línea',
 }
 
-export const GAME_ICON: Record<Game, string> = { emoji: '😀', quiz: '❓', taboo: '🤫', cipher: '🔐', auction: '🔨' }
+export const GAME_ICON: Record<Game, string> = { emoji: '😀', quiz: '❓', taboo: '🤫', cipher: '🔐', auction: '🔨', timeline: '🧍' }
 
 export const CIPHER_KINDS: CipherKind[] = ['numeros', 'reverso', 'anagrama', 'desplazado', 'sin_vocales', 'acertijo', 'frase']
 
@@ -53,6 +54,10 @@ export const CIPHER_SECONDS = 60
 export const VERSE_SECONDS = 60
 export const AUCTION_BID_SECONDS = 30
 export const AUCTION_ANSWER_SECONDS = 40
+export const TIMELINE_SECONDS = 120
+/** Espera tras un orden incorrecto, y máximo de errores por ronda. */
+export const TIMELINE_RETRY_SECONDS = 8
+export const TIMELINE_MAX_WRONG = 6
 
 // Deben coincidir con emoji_points / quiz_points / taboo_points en supabase/schema.sql
 export const EMOJI_TIERS = [100, 70, 50, 30]
@@ -68,6 +73,11 @@ export const VERSE_PER_SECOND = 0.5
 export const AUCTION_START_BALANCE = 300
 export const AUCTION_MIN_BID = 20
 export const AUCTION_MAX_BID = 150
+
+// Línea del Tiempo: deben coincidir con timeline_points en schema.sql
+export const TIMELINE_PLACE_POINTS = [100, 80, 65, 50]
+export const TIMELINE_WRONG_PENALTY = 10
+export const TIMELINE_MIN_POINTS = 30
 
 /** Categorías sugeridas; el banco acepta otras escritas a mano. */
 export const AUCTION_CATEGORIES = [
@@ -171,6 +181,27 @@ export interface AuctionQuestion {
   answer: string
   aliases: string[]
   reference: string | null
+}
+
+export interface TimelineSet {
+  id: string
+  difficulty: Difficulty
+  title: string
+  /** En orden cronológico. */
+  events: string[]
+  explanation: string | null
+}
+
+export interface TimelineResult {
+  round_id: string
+  team_id: string
+  attempts: number
+  wrong: number
+  last_try_at: string | null
+  solved_at: string | null
+  elapsed_ms: number | null
+  place: number | null
+  points: number
 }
 
 export interface Auction {
@@ -304,7 +335,7 @@ export interface PlayerState {
     points: number
     rank: number | null
     players: number
-    team: { id: string; name: string; seq: number } | null
+    team: { id: string; name: string; seq: number; members: string[] } | null
   }
   round: (Omit<Round, 'room_id' | 'item_id'> & {
     team: { id: string; name: string; seq: number } | null
@@ -353,6 +384,25 @@ export interface PlayerState {
       balance_after: number | null
     } | null
     standings: { name: string; seq: number; balance: number }[]
+  } | null
+  /** Línea del Tiempo: solo la tarjeta propia; el resto llega al acertar o al revelar. */
+  timeline: {
+    card: string | null
+    teammates: { id: string; name: string }[]
+    result: {
+      attempts: number
+      wrong: number
+      solved: boolean
+      place: number | null
+      points: number
+      elapsed_ms: number | null
+      /** Tras un orden incorrecto, cuándo se puede volver a intentar. */
+      retry_at: string | null
+    } | null
+    team_order: { name: string; event: string }[] | null
+    solution: { events: string[]; explanation: string | null } | null
+    teams_total: number
+    teams_solved: number
   } | null
   my_answer: {
     choice: number | null

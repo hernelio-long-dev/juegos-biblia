@@ -82,6 +82,17 @@ create table if not exists public.auction_questions (
   created_at timestamptz not null default now()
 );
 
+-- Línea del Tiempo Humana: `events` va en orden cronológico; cada equipo recibe
+-- tantas tarjetas como integrantes, sacadas al azar de esta lista.
+create table if not exists public.timeline_sets (
+  id          uuid primary key default gen_random_uuid(),
+  difficulty  text not null check (difficulty in ('facil','intermedio','dificil')),
+  title       text not null check (char_length(trim(title)) between 1 and 80),
+  events      text[] not null check (array_length(events, 1) between 4 and 8),
+  explanation text,
+  created_at  timestamptz not null default now()
+);
+
 create table if not exists public.rooms (
   id               uuid primary key default gen_random_uuid(),
   name             text not null,
@@ -168,7 +179,7 @@ alter table public.auction_teams replica identity full;
 create table if not exists public.rounds (
   id             uuid primary key default gen_random_uuid(),
   room_id        uuid not null references public.rooms(id) on delete cascade,
-  game           text not null check (game in ('emoji','quiz','taboo','cipher','auction')),
+  game           text not null check (game in ('emoji','quiz','taboo','cipher','auction','timeline')),
   difficulty     text not null check (difficulty in ('facil','intermedio','dificil')),
   item_id        uuid not null,
   seq            int  not null,
@@ -205,7 +216,7 @@ do $$ begin
   alter table public.rounds add column if not exists auction_id uuid references public.auctions(id) on delete set null;
   alter table public.rounds add column if not exists category text;
   alter table public.rounds drop constraint if exists rounds_game_check;
-  alter table public.rounds add  constraint rounds_game_check   check (game in ('emoji','quiz','taboo','cipher','auction'));
+  alter table public.rounds add  constraint rounds_game_check   check (game in ('emoji','quiz','taboo','cipher','auction','timeline'));
   alter table public.rounds drop constraint if exists rounds_status_check;
   alter table public.rounds add  constraint rounds_status_check check (status in ('pending','active','revealed'));
   if not exists (select 1 from pg_constraint where conname = 'rounds_team_fk') then
@@ -263,6 +274,31 @@ create table if not exists public.auction_bids (
   delta           int,     -- se llena al revelar: lo que ganó o perdió
   balance_after   int,
   primary key (round_id, auction_team_id)
+);
+
+-- Línea del Tiempo: la tarjeta secreta de cada participante en la ronda.
+-- `pos` es su lugar en la cronología del set. Solo la lee el admin.
+create table if not exists public.timeline_cards (
+  round_id       uuid not null references public.rounds(id) on delete cascade,
+  team_id        uuid not null references public.teams(id) on delete cascade,
+  participant_id uuid not null references public.participants(id) on delete cascade,
+  event          text not null,
+  pos            int  not null,
+  primary key (round_id, participant_id)
+);
+
+-- Línea del Tiempo: intentos y resultado de cada equipo en la ronda.
+create table if not exists public.timeline_results (
+  round_id    uuid not null references public.rounds(id) on delete cascade,
+  team_id     uuid not null references public.teams(id) on delete cascade,
+  attempts    int  not null default 0,
+  wrong       int  not null default 0,
+  last_try_at timestamptz,
+  solved_at   timestamptz,
+  elapsed_ms  int,
+  place       int,
+  points      int  not null default 0,
+  primary key (round_id, team_id)
 );
 
 -- ---------------------------------------------------------------------
@@ -391,6 +427,16 @@ $$;
 create or replace function public.auction_max_bid(p_balance int) returns int
 language sql immutable as $$ select greatest(20, least(150, p_balance)) $$;
 
+-- Línea del Tiempo: según el orden de llegada (1º 100, 2º 80, 3º 65, luego 50),
+-- menos 10 por cada intento fallido (mínimo 30), todo × nivel. Lo gana cada integrante.
+create or replace function public.timeline_points(p_difficulty text, p_place int, p_wrong int) returns int
+language sql immutable as $$
+  select round(
+    greatest(30, (case p_place when 1 then 100 when 2 then 80 when 3 then 65 else 50 end) - 10 * coalesce(p_wrong, 0))
+    * (case p_difficulty when 'dificil' then 2.0 when 'intermedio' then 1.5 else 1.0 end)
+  )::int
+$$;
+
 -- ---------------------------------------------------------------------
 -- FUNCIONES DEL ADMINISTRADOR
 -- ---------------------------------------------------------------------
@@ -453,6 +499,15 @@ begin
       ) then
         return false;
       end if;
+    elsif rd.game = 'timeline' then
+      -- Se cierra al vencer el tiempo o cuando ya ningún equipo puede seguir
+      -- (todos acertaron o agotaron sus 6 intentos).
+      if clock_timestamp() < rd.deadline and exists (
+        select 1 from timeline_results tr
+         where tr.round_id = rd.id and tr.solved_at is null and tr.wrong < 6
+      ) then
+        return false;
+      end if;
     elsif rd.game = 'auction' then
       -- Se cierra al vencer el tiempo o cuando todos los equipos respondieron.
       if clock_timestamp() < rd.deadline and exists (
@@ -488,6 +543,7 @@ begin
       when 'taboo'  then (select ti.word from taboo_items ti where ti.id = r.item_id)
       when 'cipher' then (select ci.answer from cipher_items ci where ci.id = r.item_id)
       when 'auction' then (select aq.answer from auction_questions aq where aq.id = r.item_id)
+      when 'timeline' then (select array_to_string(ts.events, ' → ') from timeline_sets ts where ts.id = r.item_id)
       else (select q.options[q.correct_index + 1] from quiz_questions q where q.id = r.item_id) end,
     correct_index = case when r.game = 'quiz'
       then (select q.correct_index from quiz_questions q where q.id = r.item_id) end,
@@ -597,12 +653,15 @@ begin
   if exists (select 1 from rounds where room_id = p_room and game = 'taboo' and status <> 'revealed') then
     raise exception 'Termina la ronda de Tabú en curso antes de rehacer los equipos';
   end if;
+  if exists (select 1 from rounds where room_id = p_room and game = 'timeline' and status <> 'revealed') then
+    raise exception 'Termina la ronda de Línea del Tiempo antes de rehacer los equipos';
+  end if;
   if exists (select 1 from auctions where room_id = p_room and status = 'running') then
     raise exception 'Termina la Subasta Bíblica antes de rehacer los equipos';
   end if;
   select count(*) into v_count from room_players where room_id = p_room;
   if v_count < 2 then raise exception 'Se necesitan al menos 2 participantes dentro de la sala'; end if;
-  v_n := greatest(2, least(coalesce(p_teams, 2), 12, v_count));
+  v_n := greatest(1, least(coalesce(p_teams, 2), 12, v_count));
 
   delete from teams where room_id = p_room;  -- en cascada borra team_members
   for i in 1..v_n loop
@@ -630,6 +689,11 @@ begin
   if exists (select 1 from auctions where room_id = p_room and status = 'running')
      and exists (select 1 from team_members where room_id = p_room and participant_id = p_participant) then
     raise exception 'Durante la Subasta Bíblica no se puede cambiar a nadie de equipo';
+  end if;
+  -- Quien ya tiene tarjeta en la línea del tiempo en curso no puede cambiar de equipo.
+  if exists (select 1 from timeline_cards c join rounds rd on rd.id = c.round_id
+              where rd.room_id = p_room and rd.status <> 'revealed' and c.participant_id = p_participant) then
+    raise exception 'Esa persona tiene una tarjeta en la ronda en curso. Espera a que termine.';
   end if;
   delete from team_members where room_id = p_room and participant_id = p_participant;
   if p_team is not null then
@@ -902,6 +966,96 @@ begin
   return json_build_object('ok', true, 'members', v_n);
 end $$;
 
+-- LÍNEA DEL TIEMPO HUMANA ----------------------------------------------
+-- Reparte en privado una tarjeta a cada integrante: cada equipo recibe tantos
+-- acontecimientos del set como personas tiene, elegidos al azar, así dos equipos
+-- casi nunca tienen las mismas tarjetas. Equipos de 4 o más: si la sala aún no tiene
+-- equipos, los forma; si alguien entró después del reparto, lo suma al equipo más chico.
+create or replace function public.start_timeline_round(p_room uuid, p_difficulty text) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare v_seq int; v_id uuid; v_old uuid; st timeline_sets; v_count int; v_bad text; tm teams; v_k int;
+        v_p uuid; v_max int; v_teams int;
+begin
+  if not is_admin() then raise exception 'No autorizado'; end if;
+  if not exists (select 1 from rooms where id = p_room and status = 'open') then
+    raise exception 'La sala no está abierta';
+  end if;
+  if exists (select 1 from auctions where room_id = p_room and status = 'running') then
+    raise exception 'Hay una Subasta Bíblica en curso. Termínala antes de cambiar de juego.';
+  end if;
+  for v_old in select id from rounds where room_id = p_room and status <> 'revealed' loop
+    perform reveal_round(v_old, true);
+  end loop;
+
+  select count(*) into v_count from room_players where room_id = p_room;
+  if v_count < 2 then raise exception 'Se necesitan al menos 2 participantes dentro de la sala'; end if;
+  if not exists (select 1 from team_members where room_id = p_room) then
+    -- Grupos de 4 o más: 10 personas → 5 + 5; 7 personas → un solo equipo de 7.
+    perform assign_teams(p_room, greatest(1, v_count / 4));
+  end if;
+  -- Nadie se queda sin equipo: quien llegó después del reparto va al equipo más chico.
+  for v_p in select rp.participant_id from room_players rp
+              where rp.room_id = p_room
+                and not exists (select 1 from team_members m where m.room_id = p_room and m.participant_id = rp.participant_id)
+              order by rp.joined_at loop
+    insert into team_members(team_id, room_id, participant_id)
+    select t.id, p_room, v_p from teams t
+     where t.room_id = p_room
+     order by (select count(*) from team_members m where m.team_id = t.id), t.seq
+     limit 1;
+  end loop;
+
+  -- Mínimo 4 por equipo (salvo que en toda la sala haya menos de 4 y jueguen en uno solo).
+  select count(*) into v_teams from teams t
+   where t.room_id = p_room and exists (select 1 from team_members m where m.team_id = t.id);
+  select string_agg(t.name || ' (' || x.n || ')', ', ' order by t.seq) into v_bad
+    from teams t cross join lateral (select count(*) as n from team_members m where m.team_id = t.id) x
+   where t.room_id = p_room and x.n between 1 and 3 and v_teams > 1;
+  if v_bad is not null then
+    raise exception 'Cada equipo necesita al menos 4 integrantes (revisa: %). Pulsa «Formar equipos de 4 o más».', v_bad;
+  end if;
+
+  -- Cada integrante recibe una tarjeta: la línea debe tener al menos tantas como el equipo más grande.
+  select max(x.n) into v_max from teams t
+   cross join lateral (select count(*) as n from team_members m where m.team_id = t.id) x
+   where t.room_id = p_room;
+  select * into st from timeline_sets ts
+   where ts.difficulty = p_difficulty
+     and array_length(ts.events, 1) >= v_max
+     and not exists (select 1 from rounds r where r.room_id = p_room and r.item_id = ts.id)
+   order by random() limit 1;
+  if not found then
+    raise exception 'Ya no quedan líneas del tiempo de nivel % con al menos % acontecimientos (hay un equipo de %). Agrega más en el banco o usa otro nivel.',
+      p_difficulty, v_max, v_max;
+  end if;
+
+  select coalesce(max(seq), 0) + 1 into v_seq from rounds where room_id = p_room;
+  insert into rounds(room_id, game, difficulty, item_id, seq, category, started_at, deadline)
+  values (p_room, 'timeline', st.difficulty, st.id, v_seq, st.title,
+          clock_timestamp(), clock_timestamp() + interval '120 seconds')
+  returning id into v_id;
+
+  for tm in select t.* from teams t
+             where t.room_id = p_room and exists (select 1 from team_members m where m.team_id = t.id)
+             order by t.seq loop
+    select count(*) into v_k from team_members where team_id = tm.id;
+    with pos as (
+      select p, row_number() over (order by random()) as rn
+        from (select p from generate_series(1, array_length(st.events, 1)) p order by random() limit v_k) x
+    ), mem as (
+      select participant_id, row_number() over (order by random()) as rn
+        from team_members where team_id = tm.id
+    )
+    insert into timeline_cards(round_id, team_id, participant_id, event, pos)
+    select v_id, tm.id, mem.participant_id, st.events[pos.p], pos.p
+      from mem join pos on pos.rn = mem.rn;
+    insert into timeline_results(round_id, team_id) values (v_id, tm.id);
+  end loop;
+
+  update rooms set current_round_id = v_id, view = 'round' where id = p_room;
+  return v_id;
+end $$;
+
 create or replace function public.set_room_view(p_room uuid, p_view text) returns void
 language plpgsql security definer set search_path = public as $$
 begin
@@ -968,8 +1122,8 @@ language sql stable security definer set search_path = public as $$
     from s order by pts desc, name;
 $$;
 
--- Tabla por equipos (solo Tabú). Los puntos del equipo son los de la ronda,
--- no la suma de lo que recibió cada integrante.
+-- Tabla por equipos (Tabú y Línea del Tiempo). Los puntos del equipo son los
+-- de la ronda, no la suma de lo que recibió cada integrante.
 create or replace function public.room_team_scoreboard(p_room uuid)
 returns table(team_id uuid, name text, seq int, members int, points int, wins int, rank int)
 language sql stable security definer set search_path = public as $$
@@ -979,6 +1133,10 @@ language sql stable security definer set search_path = public as $$
       left join answers a on a.round_id = rd.id
      where rd.room_id = p_room and rd.game = 'taboo' and rd.status = 'revealed'
      group by rd.id, rd.team_id
+    union all
+    select tr.round_id, tr.team_id, tr.points
+      from timeline_results tr join rounds rd on rd.id = tr.round_id
+     where rd.room_id = p_room and rd.status = 'revealed'
   ), s as (
     select t.id, t.name, t.seq,
            (select count(*) from team_members m where m.team_id = t.id)::int as members,
@@ -992,7 +1150,7 @@ $$;
 
 -- Acumulado histórico por persona: suma todo lo ganado en cualquier sala marcada
 -- como «cuenta para el histórico», sin importar si sigue abierta o si la persona
--- ya no está dentro. p_game: null | 'emoji' | 'quiz' | 'taboo' | 'cipher' | 'auction'
+-- ya no está dentro. p_game: null | 'emoji' | 'quiz' | 'taboo' | 'cipher' | 'auction' | 'timeline'
 create or replace function public.global_scoreboard(p_game text default null)
 returns table(participant_id uuid, name text, points int, correct int, rooms int, rank int)
 language sql stable security definer set search_path = public as $$
@@ -1058,6 +1216,7 @@ declare
   v_team json; v_secret json; v_round_team json; v_describer text; v_mine boolean := false;
   v_cipher json; v_verse json;
   au auctions; atm auction_teams; b auction_bids; v_auction json;
+  v_timeline json; v_tl_team uuid; tr timeline_results;
 begin
   select * into t from player_tokens where token = p_token;
   if not found then return null; end if;
@@ -1094,9 +1253,41 @@ begin
     end if;
   end if;
 
-  select json_build_object('id', tm.id, 'name', tm.name, 'seq', tm.seq) into v_team
+  select json_build_object('id', tm.id, 'name', tm.name, 'seq', tm.seq,
+           'members', (select coalesce(json_agg(p.name order by p.name), '[]'::json)
+                         from team_members m2 join participants p on p.id = m2.participant_id
+                        where m2.team_id = tm.id)) into v_team
     from team_members m join teams tm on tm.id = m.team_id
    where m.room_id = t.room_id and m.participant_id = t.participant_id;
+
+  -- Línea del Tiempo: cada quien ve solo su tarjeta. El orden de su equipo, al acertar;
+  -- la cronología completa, al revelar.
+  if rd.id is not null and rd.game = 'timeline' then
+    select c.team_id into v_tl_team from timeline_cards c where c.round_id = rd.id and c.participant_id = t.participant_id;
+    if v_tl_team is not null then
+      select * into tr from timeline_results x where x.round_id = rd.id and x.team_id = v_tl_team;
+    end if;
+    select json_build_object(
+      'card', (select c.event from timeline_cards c where c.round_id = rd.id and c.participant_id = t.participant_id),
+      'teammates', (select coalesce(json_agg(json_build_object('id', p.id, 'name', p.name) order by p.name), '[]'::json)
+                      from timeline_cards c join participants p on p.id = c.participant_id
+                     where c.round_id = rd.id and c.team_id = v_tl_team),
+      'result', case when tr.round_id is null then null else json_build_object(
+        'attempts', tr.attempts, 'wrong', tr.wrong, 'solved', tr.solved_at is not null,
+        'place', tr.place, 'points', tr.points, 'elapsed_ms', tr.elapsed_ms,
+        'retry_at', case when tr.solved_at is null and tr.last_try_at is not null
+                         then tr.last_try_at + interval '8 seconds' end) end,
+      'team_order', case when tr.solved_at is not null or rd.status = 'revealed' then
+        (select json_agg(json_build_object('name', p.name, 'event', c.event) order by c.pos)
+           from timeline_cards c join participants p on p.id = c.participant_id
+          where c.round_id = rd.id and c.team_id = v_tl_team) end,
+      'solution', case when rd.status = 'revealed' then
+        (select json_build_object('events', ts.events, 'explanation', ts.explanation)
+           from timeline_sets ts where ts.id = rd.item_id) end,
+      'teams_total', (select count(*) from timeline_results x where x.round_id = rd.id),
+      'teams_solved', (select count(*) from timeline_results x where x.round_id = rd.id and x.solved_at is not null)
+    ) into v_timeline;
+  end if;
 
   if rd.id is not null and rd.game = 'taboo' then
     select json_build_object('id', tm.id, 'name', tm.name, 'seq', tm.seq) into v_round_team
@@ -1176,6 +1367,7 @@ begin
       'secret', v_secret, 'cipher', v_cipher, 'verse', v_verse,
       'auction_id', rd.auction_id, 'category', rd.category) end,
     'auction', v_auction,
+    'timeline', v_timeline,
     'my_answer', case when a.id is null then null else json_build_object(
       'choice', a.choice, 'answer_text', a.answer_text,
       'is_correct', case when v_show then a.is_correct end,
@@ -1345,6 +1537,68 @@ begin
   return json_build_object('ok', true, 'correct', true, 'points', v_pts);
 end $$;
 
+-- LÍNEA DEL TIEMPO — un integrante envía el orden en que están parados.
+-- Solo se dice si es correcto o no, nunca qué posiciones fallan. Tras un error hay
+-- 8 s de espera y como máximo 6 errores, para que no se pueda probar a lo bruto.
+create or replace function public.submit_timeline(p_token uuid, p_round uuid, p_order uuid[]) returns json
+language plpgsql security definer set search_path = public as $$
+declare
+  t player_tokens; rd rounds; v_team uuid; tr timeline_results; v_pos int[]; v_holders int;
+  v_ok boolean; v_place int; v_pts int; v_elapsed int;
+begin
+  select * into t from player_tokens where token = p_token;
+  if not found then raise exception 'Sesión inválida'; end if;
+  -- for update: dos equipos que aciertan a la vez no pueden quedar ambos en 1er lugar.
+  select * into rd from rounds where id = p_round and room_id = t.room_id and game = 'timeline' for update;
+  if not found then raise exception 'Ronda no válida'; end if;
+  if rd.status <> 'active' or (select current_round_id from rooms where id = t.room_id) is distinct from rd.id then
+    return json_build_object('ok', false, 'reason', 'closed');
+  end if;
+  if clock_timestamp() > rd.deadline + interval '2 seconds' then
+    return json_build_object('ok', false, 'reason', 'timeout');
+  end if;
+
+  select team_id into v_team from timeline_cards where round_id = rd.id and participant_id = t.participant_id;
+  if v_team is null then return json_build_object('ok', false, 'reason', 'no_card'); end if;
+  select * into tr from timeline_results where round_id = rd.id and team_id = v_team;
+  if tr.solved_at is not null then return json_build_object('ok', true, 'correct', true, 'already', true); end if;
+  if tr.wrong >= 6 then return json_build_object('ok', false, 'reason', 'max_attempts'); end if;
+  if tr.last_try_at is not null and clock_timestamp() < tr.last_try_at + interval '8 seconds' then
+    return json_build_object('ok', false, 'reason', 'cooldown');
+  end if;
+
+  -- El orden debe tener a cada integrante con tarjeta exactamente una vez.
+  select count(*) into v_holders from timeline_cards where round_id = rd.id and team_id = v_team;
+  select array_agg(c.pos order by o.idx) into v_pos
+    from unnest(p_order) with ordinality o(pid, idx)
+    join timeline_cards c on c.round_id = rd.id and c.team_id = v_team and c.participant_id = o.pid;
+  if coalesce(array_length(p_order, 1), 0) <> v_holders
+     or coalesce(array_length(v_pos, 1), 0) <> v_holders
+     or (select count(distinct x) from unnest(p_order) x) <> v_holders then
+    return json_build_object('ok', false, 'reason', 'invalid');
+  end if;
+  v_ok := v_pos = (select array_agg(x order by x) from unnest(v_pos) x);
+
+  if not v_ok then
+    update timeline_results set attempts = attempts + 1, wrong = wrong + 1, last_try_at = clock_timestamp()
+     where round_id = rd.id and team_id = v_team;
+    return json_build_object('ok', true, 'correct', false, 'wrong', tr.wrong + 1);
+  end if;
+
+  select 1 + count(*) into v_place from timeline_results where round_id = rd.id and solved_at is not null;
+  v_pts := timeline_points(rd.difficulty, v_place, tr.wrong);
+  v_elapsed := greatest(0, (extract(epoch from clock_timestamp() - rd.started_at) * 1000)::int);
+  update timeline_results set attempts = attempts + 1, last_try_at = clock_timestamp(), solved_at = clock_timestamp(),
+                              elapsed_ms = v_elapsed, place = v_place, points = v_pts
+   where round_id = rd.id and team_id = v_team;
+  -- Los puntos son de todo el equipo: cada integrante que recibió tarjeta suma lo mismo.
+  insert into answers(round_id, room_id, participant_id, is_correct, points, elapsed_ms)
+  select rd.id, rd.room_id, c.participant_id, true, v_pts, v_elapsed
+    from timeline_cards c where c.round_id = rd.id and c.team_id = v_team
+  on conflict do nothing;
+  return json_build_object('ok', true, 'correct', true, 'place', v_place, 'points', v_pts);
+end $$;
+
 -- SUBASTA — equipo del participante en la subasta de esa ronda (null si no tiene).
 create or replace function public.auction_team_of(p_auction uuid, p_participant uuid) returns auction_teams
 language sql stable security definer set search_path = public as $$
@@ -1464,6 +1718,9 @@ alter table public.auction_questions enable row level security;
 alter table public.auctions       enable row level security;
 alter table public.auction_teams  enable row level security;
 alter table public.auction_bids   enable row level security;
+alter table public.timeline_sets  enable row level security;
+alter table public.timeline_cards enable row level security;
+alter table public.timeline_results enable row level security;
 
 drop policy if exists admins_self on public.admins;
 create policy admins_self on public.admins for select to authenticated using (user_id = auth.uid());
@@ -1512,6 +1769,14 @@ create policy auction_teams_admin on public.auction_teams for all to authenticat
 drop policy if exists auction_bids_admin on public.auction_bids;
 create policy auction_bids_admin on public.auction_bids for all to authenticated using (is_admin()) with check (is_admin());
 
+-- Línea del Tiempo: tarjetas e intentos solo por funciones (player_state) o el admin.
+drop policy if exists timeline_sets_admin on public.timeline_sets;
+create policy timeline_sets_admin on public.timeline_sets for all to authenticated using (is_admin()) with check (is_admin());
+drop policy if exists timeline_cards_admin on public.timeline_cards;
+create policy timeline_cards_admin on public.timeline_cards for all to authenticated using (is_admin()) with check (is_admin());
+drop policy if exists timeline_results_admin on public.timeline_results;
+create policy timeline_results_admin on public.timeline_results for all to authenticated using (is_admin()) with check (is_admin());
+
 drop policy if exists rooms_read on public.rooms;
 create policy rooms_read on public.rooms for select to anon, authenticated using (true);
 drop policy if exists rooms_admin on public.rooms;
@@ -1542,7 +1807,8 @@ grant select, insert, update, delete on
   public.cipher_items, public.rooms,
   public.room_codes, public.room_players, public.rounds, public.answers,
   public.teams, public.team_members,
-  public.auction_questions, public.auctions, public.auction_teams, public.auction_bids to authenticated;
+  public.auction_questions, public.auctions, public.auction_teams, public.auction_bids,
+  public.timeline_sets, public.timeline_cards, public.timeline_results to authenticated;
 grant select on public.admins to authenticated;
 revoke all on public.player_tokens from anon, authenticated;
 
@@ -1553,7 +1819,8 @@ revoke execute on function public.create_room(text), public.reveal_round(uuid, b
   public.start_taboo_round(uuid, text, uuid), public.start_taboo_timer(uuid),
   public.stop_taboo(uuid, boolean),
   public.start_auction(uuid, int, boolean), public.start_auction_round(uuid, text),
-  public.close_auction_bids(uuid, boolean), public.finish_auction(uuid) from anon, public;
+  public.close_auction_bids(uuid, boolean), public.finish_auction(uuid),
+  public.start_timeline_round(uuid, text) from anon, public;
 -- Internas: solo se llaman desde otras funciones.
 revoke execute on function public.settle_auction_round(uuid), public.pick_auction_controller(uuid, uuid)
   from anon, authenticated, public;
@@ -1564,7 +1831,8 @@ grant execute on function public.create_room(text), public.reveal_round(uuid, bo
   public.start_taboo_round(uuid, text, uuid), public.start_taboo_timer(uuid),
   public.stop_taboo(uuid, boolean),
   public.start_auction(uuid, int, boolean), public.start_auction_round(uuid, text),
-  public.close_auction_bids(uuid, boolean), public.finish_auction(uuid) to authenticated;
+  public.close_auction_bids(uuid, boolean), public.finish_auction(uuid),
+  public.start_timeline_round(uuid, text) to authenticated;
 grant execute on function public.server_now(), public.room_scoreboard(uuid, text), public.lookup_room(text),
   public.join_room(text, uuid), public.player_state(uuid), public.submit_emoji(uuid, uuid, text),
   public.submit_quiz(uuid, uuid, int), public.is_admin(),
@@ -1572,7 +1840,7 @@ grant execute on function public.server_now(), public.room_scoreboard(uuid, text
   public.room_team_scoreboard(uuid), public.room_teams(uuid),
   public.global_scoreboard(text),
   public.submit_auction_bid(uuid, uuid, int), public.submit_auction_answer(uuid, uuid, text),
-  public.claim_auction_control(uuid) to anon, authenticated;
+  public.claim_auction_control(uuid), public.submit_timeline(uuid, uuid, uuid[]) to anon, authenticated;
 
 -- ---------------------------------------------------------------------
 -- REALTIME
@@ -1581,7 +1849,7 @@ do $$
 declare tbl text;
 begin
   foreach tbl in array array['rooms','rounds','room_players','answers','teams','team_members',
-                           'auctions','auction_teams','auction_bids'] loop
+                           'auctions','auction_teams','auction_bids','timeline_results'] loop
     if not exists (select 1 from pg_publication_tables
                     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = tbl) then
       execute format('alter publication supabase_realtime add table public.%I', tbl);
@@ -1895,5 +2163,86 @@ insert into public.auction_questions (category, difficulty, question, answer, al
 ('Libros de la Biblia','intermedio','¿Qué libro cuenta cómo una reina judía salvó a su pueblo en Persia?','Ester','{esther}','Ester 1–10'),
 ('Libros de la Biblia','dificil','¿Cuál es el libro más corto del Antiguo Testamento?','Abdías','{abdias}','Abdías 1'),
 ('Libros de la Biblia','dificil','¿Qué carta escribió Pablo para pedir que recibieran de vuelta al esclavo Onésimo?','Filemón','{filemon}','Filemón 1:10-17');
+end if;
+end $$;
+
+do $$ begin
+if not exists (select 1 from public.timeline_sets) then
+insert into public.timeline_sets (difficulty, title, events, explanation) values
+-- FÁCIL: acontecimientos muy separados en el tiempo
+('facil','Personajes del Antiguo Testamento',
+ array['Adán','Noé','Abraham','Moisés','Josué','David','Elías','Daniel'],
+ 'Adán es el primer hombre (Génesis 2). Noé vive el diluvio (Génesis 6) y Abraham es llamado después (Génesis 12). Siglos más tarde Moisés saca a Israel de Egipto y Josué lo lleva a Canaán. David es rey; Elías profetiza en tiempos de Acab, y Daniel vive el exilio en Babilonia.'),
+('facil','Grandes acontecimientos del Antiguo Testamento',
+ array['La creación','El diluvio','La torre de Babel','El éxodo de Egipto','David derrota a Goliat','Daniel en el foso de los leones'],
+ 'Génesis 1, 7 y 11; Éxodo 12–14; 1 Samuel 17; Daniel 6. De los orígenes al exilio en Babilonia.'),
+('facil','La vida de Jesús',
+ array['Nacimiento de Jesús','Jesús a los 12 años en el templo','Bautismo de Jesús','Las tentaciones en el desierto','Alimentación de los cinco mil','Entrada triunfal en Jerusalén','Crucifixión','Resurrección'],
+ 'Lucas 2:7, Lucas 2:42, Mateo 3:13, Mateo 4:1, Juan 6:10, Juan 12:12-13, Mateo 27:35 y Mateo 28:6. Su ministerio público empieza con el bautismo y termina en Jerusalén.'),
+('facil','La vida de Moisés',
+ array['Moisés en una canasta en el río','Moisés huye a Madián','La zarza ardiente','Las diez plagas','El cruce del mar Rojo','El maná cae del cielo','Los Diez Mandamientos','Moisés envía a los doce espías'],
+ 'Éxodo 2:3, 2:15, 3:2, 7–11, 14, 16 y 20; Números 13. Primero huye de Egipto; Dios lo llama en la zarza y regresa a liberar al pueblo.'),
+('facil','La historia de José',
+ array['José recibe la túnica de colores','Sus hermanos lo venden','José en la cárcel','José interpreta los sueños del faraón','José gobierna Egipto','Jacob y su familia llegan a Egipto'],
+ 'Génesis 37:3, 37:28, 39:20, 41:25, 41:41 y 46:6.'),
+('facil','Los días de la creación',
+ array['La luz','La expansión que separa las aguas','La tierra seca y las plantas','El sol, la luna y las estrellas','Los peces y las aves','Los animales terrestres y el ser humano'],
+ 'Génesis 1: del día primero al sexto.'),
+('facil','La vida de David',
+ array['Samuel unge a David','David vence a Goliat','David huye de Saúl','David es rey sobre todo Israel','David lleva el arca a Jerusalén','Salomón hereda el trono'],
+ '1 Samuel 16, 17 y 19; 2 Samuel 5 y 6; 1 Reyes 1.'),
+('facil','La última semana de Jesús',
+ array['Entrada triunfal en Jerusalén','La última cena','Oración en Getsemaní','Juicio ante Pilato','Crucifixión','La tumba vacía'],
+ 'Mateo 21, 26 y 27; Mateo 28:6. Del domingo de la entrada al domingo de la resurrección.'),
+-- INTERMEDIO
+('intermedio','De Josué a Salomón',
+ array['Josué','Débora','Gedeón','Sansón','Samuel','Saúl','David','Salomón'],
+ 'Josué conquista Canaán. Débora (Jueces 4), Gedeón (Jueces 6) y Sansón (Jueces 13) son jueces. Samuel es el último juez y unge a Saúl, el primer rey, y luego a David. Salomón reina después de David.'),
+('intermedio','Los patriarcas y sus sucesores',
+ array['Abraham','Isaac','Jacob','José','Moisés','Josué'],
+ 'Abraham es padre de Isaac, Isaac de Jacob y Jacob de José (Génesis). Siglos después Moisés saca al pueblo de Egipto, y Josué lo sucede y entra a Canaán.'),
+('intermedio','Profetas',
+ array['Elías','Eliseo','Isaías','Jeremías','Daniel','Malaquías'],
+ 'Elías y su sucesor Eliseo profetizan en tiempos de Acab. Isaías, en tiempos de Ezequías. Jeremías, antes de la caída de Jerusalén. Daniel, en el exilio. Malaquías cierra el Antiguo Testamento.'),
+('intermedio','De Egipto al desierto',
+ array['La Pascua en Egipto','El cruce del mar Rojo','El maná cae del cielo','Los Diez Mandamientos','El becerro de oro','Los doce espías'],
+ 'Éxodo 12, 14, 16, 20 y 32; Números 13.'),
+('intermedio','La iglesia en Hechos',
+ array['Ascensión de Jesús','Pentecostés','Sanidad del cojo en la puerta la Hermosa','Muerte de Esteban','Conversión de Saulo','Pedro en casa de Cornelio','Un ángel libra a Pedro de la cárcel','Concilio de Jerusalén'],
+ 'Hechos 1, 2, 3, 7, 9, 10, 12 y 15.'),
+('intermedio','Señales en el evangelio de Juan',
+ array['El agua convertida en vino','Sanidad del hijo del oficial del rey','Alimentación de los cinco mil','Jesús camina sobre el mar','Sanidad del ciego de nacimiento','Resurrección de Lázaro'],
+ 'Juan 2, 4, 6:1-14, 6:16-21, 9 y 11. Juan dice que las dos primeras fueron la primera y la segunda señal.'),
+('intermedio','Reyes de Israel y Judá',
+ array['Saúl','David','Salomón','Roboam','Acab','Ezequías'],
+ 'Saúl, David y Salomón reinan sobre todo Israel. Con Roboam el reino se divide. Acab reina en el norte; Ezequías, en Judá, más de un siglo después.'),
+('intermedio','La vida de Pablo',
+ array['Cuida la ropa de los que apedrean a Esteban','Conversión camino a Damasco','Primer viaje misionero con Bernabé','Visión del varón macedonio','Arrestado en el templo de Jerusalén','Naufragio rumbo a Roma'],
+ 'Hechos 7:58, 9:3, 13:2, 16:9, 21:30 y 27:41.'),
+-- DIFÍCIL: acontecimientos muy cercanos entre sí
+('dificil','La noche del juicio de Jesús',
+ array['Oración en Getsemaní','El beso de Judas','Jesús ante el sumo sacerdote','Jesús ante Pilato','Jesús ante Herodes','Barrabás queda libre'],
+ 'Lucas 22:39-48 y 22:54; 23:1, 23:7 y 23:18-25. Pilato lo envía a Herodes, que lo devuelve a Pilato.'),
+('dificil','Las plagas de Egipto',
+ array['El agua se convierte en sangre','Las ranas','Las moscas','El granizo','Las langostas','Las tinieblas'],
+ 'Éxodo 7:20, 8:6, 8:24, 9:23, 10:13 y 10:22. Son la 1ª, 2ª, 4ª, 7ª, 8ª y 9ª plaga.'),
+('dificil','Reyes de Judá',
+ array['Roboam','Asa','Josafat','Uzías','Acaz','Ezequías','Josías','Sedequías'],
+ 'Roboam es el primer rey de Judá tras la división y Sedequías el último antes de la caída de Jerusalén. Isaías tuvo su visión el año en que murió Uzías (Isaías 6:1), y Acaz fue el padre de Ezequías.'),
+('dificil','Jueces de Israel',
+ array['Otoniel','Aod','Samgar','Débora','Gedeón','Abimelec','Jefté','Sansón'],
+ 'Jueces 3:9, 3:15, 3:31, 4:4, 6:11, 9:1, 11:1 y 13:24. Abimelec, hijo de Gedeón, se hizo rey tras la muerte de su padre.'),
+('dificil','Los primeros días de la iglesia',
+ array['Matías es elegido apóstol','Pentecostés','Sanidad del cojo en la puerta la Hermosa','Ananías y Safira','Elección de los siete','Muerte de Esteban'],
+ 'Hechos 1:26, 2, 3, 5, 6 y 7.'),
+('dificil','El regreso del exilio',
+ array['Babilonia destruye Jerusalén','Decreto de Ciro','Se termina el segundo templo','Ester es reina en Persia','Esdras llega a Jerusalén','Nehemías reconstruye los muros'],
+ '2 Reyes 25; Esdras 1 y 6:15; Ester 2:17; Esdras 7:8 y Nehemías 6:15. Ester vive en tiempos de Asuero (Jerjes), antes que Esdras y Nehemías (Artajerjes).'),
+('dificil','Elías y Eliseo',
+ array['Los cuervos alimentan a Elías','Elías resucita al hijo de la viuda','Fuego del cielo en el monte Carmelo','Elías oye un silbo apacible en Horeb','Elías sube al cielo en un torbellino','Eliseo sana a Naamán'],
+ '1 Reyes 17:6, 17:22, 18:38 y 19:12; 2 Reyes 2:11 y 5:14.'),
+('dificil','Abraham y su descendencia',
+ array['Dios llama a Abraham','Abraham y Lot se separan','Destrucción de Sodoma','Nace Isaac','Abraham ofrece a Isaac en Moriah','Jacob recibe la bendición de Isaac'],
+ 'Génesis 12, 13, 19, 21, 22 y 27.');
 end if;
 end $$;

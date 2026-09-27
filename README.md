@@ -1,6 +1,6 @@
 # Competencia Bíblica — PWA
 
-App web instalable (PWA) para competencias bíblicas en vivo con cinco juegos:
+App web instalable (PWA) para competencias bíblicas en vivo con seis juegos:
 
 1. **Adivina con emojis** — el admin revela pistas (emojis) una por una y los participantes escriben el personaje o historia.
 2. **Selección múltiple** — preguntas con 4 opciones y 20 segundos para responder.
@@ -10,6 +10,8 @@ App web instalable (PWA) para competencias bíblicas en vivo con cinco juegos:
    palabras al revés, anagramas, acertijos…) y después confirmarlo buscando el versículo en la Biblia.
 5. **Subasta bíblica** — por equipos de 3 o 4: ven solo la categoría y el nivel, apuestan parte de su saldo
    y después aparece la pregunta. Conocimiento, conversación en equipo y estrategia.
+6. **Línea del tiempo humana** — por equipos de 4 o más: cada integrante recibe en secreto un personaje o
+   acontecimiento, y el equipo se pone en fila, físicamente, en orden cronológico. Gana más quien termina primero.
 
 **Stack:** Vite + React + TypeScript · Tailwind CSS v4 · vite-plugin-pwa · Supabase (Postgres, Auth, Realtime y funciones RPC).
 
@@ -21,7 +23,7 @@ App web instalable (PWA) para competencias bíblicas en vivo con cinco juegos:
 2. Copia y pega todo el contenido de [`supabase/schema.sql`](supabase/schema.sql) y presiona **Run**.
    Crea las tablas, la seguridad, la lógica del juego y un banco inicial de **36 emojis**, **45 preguntas**,
    **36 palabras de Tabú**, **36 códigos secretos** (12 de cada nivel: fácil, intermedio, difícil) y
-   **66 preguntas de subasta** (11 categorías × 3 niveles × 2).
+   **66 preguntas de subasta** (11 categorías × 3 niveles × 2) y **24 líneas del tiempo** (8 por nivel).
 3. Crea la cuenta del administrador: **Authentication → Users → Add user → Create new user**
    (correo + contraseña, marca **Auto Confirm User**).
 4. Entra a la app en `/admin` con ese correo. **La primera cuenta que inicia sesión queda como administradora**; las demás no tendrán acceso.
@@ -69,7 +71,7 @@ npm run deploy         # compila y sube a https://competencia-biblica.<tu-subdom
 - **Equipos** (botón 🤝, solo para Tabú): eliges cuántos equipos quieres (de 2 a 6; el sistema sugiere uno
   según cuánta gente hay) y el reparto es automático y al azar, en grupos del mismo tamaño (±1).
   Puedes renombrar un equipo, mover a alguien de equipo o volver a repartir.
-- **Bancos de emojis / preguntas / Tabú / códigos / subasta:** agrega, edita o elimina contenido.
+- **Bancos de emojis / preguntas / Tabú / códigos / subasta / líneas del tiempo:** agrega, edita o elimina contenido.
 
 Atajos en la consola: `Espacio` siguiente pista/ronda (o iniciar los 45 s en Tabú, o cerrar las apuestas en la Subasta) · `Enter` ¡adivinaron! (Tabú) ·
 `R` revelar · `T` tabla · `H` ocultar controles · `F` pantalla completa.
@@ -106,6 +108,24 @@ un campo de texto (emojis), 4 botones (selección múltiple) o —en Tabú— su
 Mientras hay una subasta en curso no se puede lanzar otro juego ni cambiar a nadie de equipo (sí agregar a
 quien llegó tarde y quedó sin equipo). Si el celular controlador se desconecta, cualquier compañero puede
 pulsar **Tomar el control** en el suyo.
+
+### Cómo se juega la Línea del tiempo humana
+1. El admin elige **🧍 Línea** y el nivel. Si la sala aún no tiene equipos, al iniciar se forman solos en grupos
+   de **4 o más**, lo más parejos posible (10 personas → 5 + 5; 13 → 5 + 4 + 4; 7 → un equipo de 7); también puede
+   pulsar **🧍 Formar equipos de 4 o más** antes. **Nadie se queda sin equipo:** quien entra después del reparto
+   se suma al equipo más chico al iniciar la siguiente ronda. Cada celular muestra su equipo y sus compañeros
+   desde la pantalla de espera.
+2. **▶ Iniciar juego**: cada integrante recibe en su celular una **tarjeta secreta** (un personaje o acontecimiento).
+   Cada equipo recibe tantas tarjetas como integrantes, sacadas al azar de una lista de 6 a 8 (la ronda usa una
+   lista con al menos tantos acontecimientos como el equipo más grande), así que los equipos casi nunca tienen
+   las mismas. La pantalla grande muestra solo el tema y **2 minutos**.
+3. Los integrantes se cuentan lo que tienen y se ponen **en fila**, del más antiguo al más reciente.
+4. Cualquiera del equipo pulsa **✋ Estamos listos** y toca los nombres en el orden de la fila.
+   - ✅ Si es correcto, todo el equipo lo ve y la pantalla grande marca su lugar, **sin revelar la solución**.
+   - ⚠️ Si no, solo dice «Hay posiciones incorrectas» (nunca cuáles). Pueden volver a intentar a los 8 s,
+     hasta 6 errores.
+5. Cuando todos terminan, se acaba el tiempo o el admin pulsa **Revelar respuesta**, aparece el orden correcto
+   con una breve explicación bíblica.
 
 Si alguien cambia de celular, el admin puede **liberar** su nombre desde 👥 (conserva sus puntos).
 
@@ -215,3 +235,20 @@ la ronda (van en cascada); cerrar una sala no borra nada.
   cientos: la misma escala que los otros juegos.
 - Las apuestas y respuestas nunca viajan a los celulares de otros equipos, y la pregunta no sale del servidor
   hasta que se cierran las apuestas.
+
+### Línea del tiempo humana
+- Puntos según el **orden de llegada**, para **cada integrante** del equipo, × el nivel:
+
+| Lugar | Fácil ×1 | Intermedio ×1.5 | Difícil ×2 |
+|---|---|---|---|
+| 1º | 100 | 150 | 200 |
+| 2º | 80 | 120 | 160 |
+| 3º | 65 | 98 | 130 |
+| 4º o después | 50 | 75 | 100 |
+| no terminan | 0 | 0 | 0 |
+
+- Cada intento fallido resta **10** (antes del multiplicador), hasta un mínimo de 30. Así no conviene probar
+  órdenes al azar.
+- Los puntos entran a la tabla de la sala, a la tabla **🤝 Equipos** (junto con Tabú) y al ranking histórico.
+- Las tarjetas nunca aparecen en la pantalla grande ni en los celulares de otros equipos; el orden del propio
+  equipo solo se muestra cuando lo aciertan.

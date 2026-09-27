@@ -3,7 +3,7 @@ import { CountdownRing, DifficultyChip } from '../../components/ui'
 import { secondsLeft } from '../../lib/clock'
 import { celebrate } from '../../lib/fx'
 import { useLiveRefresh } from '../../lib/realtime'
-import { auctionTeamCount } from '../../lib/scoring'
+import { smallTeamCount } from '../../lib/scoring'
 import { supabase } from '../../lib/supabase'
 import {
   AUCTION_ANSWER_SECONDS, AUCTION_BID_SECONDS, AUCTION_MAX_BID, AUCTION_MIN_BID, AUCTION_START_BALANCE,
@@ -167,7 +167,7 @@ export function AuctionLauncher({ data, round, difficulty, setDifficulty, mix, s
   const { running, played } = data
 
   if (!running) {
-    const n = auctionTeamCount(players)
+    const n = smallTeamCount(players)
     return (
       <>
         <label className="flex items-center gap-2 px-2 text-sm text-indigo-200">
